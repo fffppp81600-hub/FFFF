@@ -1,5 +1,5 @@
 """
-bot.py — Render Ready Full Version
+bot.py — Render Ready Fixed Version (No Conflict + Safe Polling)
 """
 
 import os
@@ -31,26 +31,33 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
 
-# ───────── Flask for Render ─────────
+
+# ─────────────────────────────
+# Flask (Render keep-alive)
+# ─────────────────────────────
 
 web = Flask(__name__)
 
 @web.get("/")
 def home():
-    return "Bot running on Render 🚀"
+    return "Bot is running 🚀"
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
     web.run(host="0.0.0.0", port=port)
 
-# ───────── Bot setup ─────────
+
+# ─────────────────────────────
+# Telegram App
+# ─────────────────────────────
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 _cooldown = {}
 EDIT_MODE = {}
 
-def allow(uid):
+
+def allow(uid: str) -> bool:
     now = time.time()
     if now - _cooldown.get(uid, 0) < 5:
         return False
@@ -58,31 +65,35 @@ def allow(uid):
     return True
 
 
-# ───────── Commands ─────────
+# ─────────────────────────────
+# Commands
+# ─────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 البوت شغال على Render")
+    await update.message.reply_text("👋 البوت شغال على Render 🚀")
 
 async def my(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.message.from_user.id)
     projects = get_projects(uid)
 
     if not projects:
-        await update.message.reply_text("لا يوجد مشاريع")
+        await update.message.reply_text("📭 ما عندك مشاريع")
         return
 
-    msg = ""
+    msg = "📂 مشاريعك:\n\n"
     for p in projects:
-        msg += f"{p['name']} → {p['url']}\n"
+        msg += f"🌐 {p['name']} → {p['url']}\n"
 
     await update.message.reply_text(msg)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     EDIT_MODE.pop(str(update.message.from_user.id), None)
-    await update.message.reply_text("تم الإلغاء")
+    await update.message.reply_text("❌ تم الإلغاء")
 
 
-# ───────── Main handler ─────────
+# ─────────────────────────────
+# Main handler
+# ─────────────────────────────
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.message.from_user.id)
@@ -92,7 +103,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not allow(uid):
-        await update.message.reply_text("انتظر شوي")
+        await update.message.reply_text("⏳ انتظر شوي")
         return
 
     await update.message.reply_text("🚀 جاري إنشاء الموقع...")
@@ -102,7 +113,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = safe_parse(ai_response)
 
         if not data:
-            await update.message.reply_text("فشل AI")
+            await update.message.reply_text("❌ فشل AI في توليد المشروع")
             return
 
         build_project(data, uid)
@@ -112,20 +123,22 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_project(uid, data["projectName"], url)
 
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("فتح الموقع", url=url)]
+            [InlineKeyboardButton("🌐 فتح الموقع", url=url)]
         ])
 
         await update.message.reply_text(
-            f"تم إنشاء الموقع:\n{url}",
+            f"✅ تم إنشاء الموقع:\n{url}",
             reply_markup=keyboard
         )
 
     except Exception as e:
         log(str(e))
-        await update.message.reply_text("خطأ")
+        await update.message.reply_text("❌ خطأ أثناء إنشاء الموقع")
 
 
-# ───────── Handlers ─────────
+# ─────────────────────────────
+# Handlers
+# ─────────────────────────────
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("my", my))
@@ -133,10 +146,17 @@ app.add_handler(CommandHandler("cancel", cancel))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
 
-# ───────── Run ─────────
+# ─────────────────────────────
+# Run (FIXED POLLING)
+# ─────────────────────────────
 
 if __name__ == "__main__":
-    log("Bot starting on Render")
+    log("Bot starting on Render 🚀")
 
-    threading.Thread(target=run_web).start()
-    app.run_polling()
+    # تشغيل Flask في thread
+    threading.Thread(target=run_web, daemon=True).start()
+
+    # 🔥 FIX IMPORTANT: يمنع Conflict 409
+    app.run_polling(
+        drop_pending_updates=True
+    )
