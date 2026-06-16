@@ -1,12 +1,12 @@
 """
-server.py — Flask server يعرض المواقع المحلية + يشغل البوت في thread منفصل.
-شغّل هذا الملف بدل bot.py مباشرة.
+server.py — يشغل Flask في thread ثانوي والبوت في الـ main thread.
 """
 import os
 import threading
 from flask import Flask, send_from_directory, abort
 
 SITES_DIR = os.path.join(os.path.dirname(__file__), "sites")
+os.makedirs(SITES_DIR, exist_ok=True)
 
 app = Flask(__name__)
 
@@ -26,19 +26,17 @@ def home():
 def health():
     return "OK", 200
 
-def run_bot():
-    # import هنا عشان يصير بعد ما Flask يبدأ
-    import asyncio
-    from bot import app as telegram_app
-    from logger import log
-    log("✅ البوت يعمل في thread منفصل...")
-    telegram_app.run_polling()
+def run_flask():
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    # شغّل البوت في thread منفصل
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+    # Flask في thread ثانوي
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
 
-    # شغّل Flask
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    # البوت في الـ main thread
+    from bot import app as telegram_app
+    from logger import log
+    log("✅ البوت يعمل...")
+    telegram_app.run_polling()
