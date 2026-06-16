@@ -1,7 +1,3 @@
-"""
-deploy.py — بدل Vercel، نحفظ الملفات محلياً ونعرضها عبر Flask.
-كل مشروع يحفظ في مجلد /sites/<name>/ ويُعرض على /s/<name>/
-"""
 import os
 import shutil
 from logger import log
@@ -9,11 +5,14 @@ from logger import log
 SITES_DIR = os.path.join(os.path.dirname(__file__), "sites")
 os.makedirs(SITES_DIR, exist_ok=True)
 
-# رابط السيرفر — حطه في .env
-BASE_URL = os.getenv("BASE_URL", "http://localhost:5000")
+# لازم يكون https — حطه في Render Environment Variables
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 
 
 def deploy_project(name: str, files: list) -> str:
+    if not BASE_URL:
+        raise Exception("BASE_URL غير محدد في متغيرات البيئة!")
+
     project_dir = os.path.join(SITES_DIR, name)
     os.makedirs(project_dir, exist_ok=True)
 
