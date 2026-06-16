@@ -117,8 +117,7 @@ def _project_keyboard(proj_name: str, url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🌐 افتح الموقع", url=url),
          InlineKeyboardButton("✏️ تعديل", callback_data=f"edit|{proj_name}")],
-        [InlineKeyboardButton("📋 نسخ الرابط", callback_data=f"copy|{proj_name}|{url}"),
-         InlineKeyboardButton("🗑 حذف", callback_data=f"del|{proj_name}")],
+        [InlineKeyboardButton("🗑 حذف", callback_data=f"del|{proj_name}")],
     ])
 
 
@@ -293,12 +292,11 @@ async def _do_deploy(update: Update, uid: str, data: dict):
         log(f"[DEPLOY_OK] uid={uid} proj={data['projectName']} url={url}")
 
         await update.message.reply_text(
-            f"✅ *موقعك جاهز!*\n\n"
-            f"📛 الاسم: `{data['projectName']}`\n"
+            f"✅ موقعك جاهز!\n\n"
+            f"📛 الاسم: {data['projectName']}\n"
             f"🔗 {url}\n\n"
             f"استخدم الأزرار للتحكم بموقعك 👇",
             reply_markup=_project_keyboard(data["projectName"], url),
-            parse_mode="Markdown"
         )
     except Exception as e:
         log(f"[DEPLOY_ERR] uid={uid} err={e}")
@@ -387,11 +385,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("↩️ تم إلغاء الحذف.")
 
     elif action == "copy":
-        url = parts[2] if len(parts) > 2 else ""
-        await q.message.reply_text(
-            f"📋 رابط `{proj}`:\n\n`{url}`",
-            parse_mode="Markdown"
-        )
+        pass  # تم حذف زر النسخ
 
 
 # ── Entry point ────────────────────────────────
