@@ -1,36 +1,35 @@
+"""
+deploy.py — بدل Vercel، نحفظ الملفات محلياً ونعرضها عبر Flask.
+كل مشروع يحفظ في مجلد /sites/<name>/ ويُعرض على /s/<name>/
+"""
 import os
-import requests
+import shutil
 from logger import log
 
-VERCEL_TOKEN = os.getenv("VERCEL_TOKEN")
+SITES_DIR = os.path.join(os.path.dirname(__file__), "sites")
+os.makedirs(SITES_DIR, exist_ok=True)
 
-HEADERS = {
-    "Authorization": f"Bearer {VERCEL_TOKEN}",
-}
+# رابط السيرفر — حطه في .env
+BASE_URL = os.getenv("BASE_URL", "http://localhost:5000")
 
-def deploy_project(name, files):
-    url = f"https://{name}.vercel.app"
 
-    try:
-        requests.post(
-            "https://api.vercel.com/v13/deployments",
-            json={
-                "name": name,
-                "files": files
-            },
-            headers=HEADERS
-        )
-    except Exception as e:
-        log(str(e))
+def deploy_project(name: str, files: list) -> str:
+    project_dir = os.path.join(SITES_DIR, name)
+    os.makedirs(project_dir, exist_ok=True)
 
+    for f in files:
+        path = os.path.join(project_dir, f["path"])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fp:
+            fp.write(f["content"])
+
+    url = f"{BASE_URL}/s/{name}/"
+    log(f"[DEPLOY_LOCAL] project={name} url={url}")
     return url
 
 
-def delete_vercel_project(name):
-    try:
-        requests.delete(
-            f"https://api.vercel.com/v9/projects/{name}",
-            headers=HEADERS
-        )
-    except:
-        pass
+def delete_vercel_project(name: str):
+    project_dir = os.path.join(SITES_DIR, name)
+    if os.path.exists(project_dir):
+        shutil.rmtree(project_dir)
+        log(f"[DELETE_LOCAL] project={name}")
