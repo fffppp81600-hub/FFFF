@@ -1,57 +1,105 @@
 """
-ai.py — Gemini 2.0 Flash with forced JSON output mode.
-response_mime_type="application/json" forces Gemini to return valid JSON always.
+ai.py — Groq (Llama 3.3 70B) — مجاني، سريع، كوتة عالية جداً.
+يحتاج: pip install groq
+ومتغير بيئة: GROQ_API_KEY (مجاني من https://console.groq.com)
 """
 import os
 import re
 import json
 import time
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from groq import Groq
 
 load_dotenv()
 
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-BASE_SYSTEM = """You are an elite Senior Frontend Engineer and UI/UX Designer AI.
+MODEL = "llama-3.3-70b-versatile"
 
-REQUIRED JSON FORMAT (return exactly this structure):
+BASE_SYSTEM = """You are an elite Senior Frontend Engineer, Game Developer, and UI/UX Designer AI with 15 years of experience building award-winning web applications.
+
+OUTPUT CONTRACT — NEVER VIOLATE:
+Return ONLY a raw JSON object. No markdown. No backticks. No explanation. No text before or after.
+First char = {   Last char = }
+
+JSON STRUCTURE:
 {
-  "projectName": "kebab-case-name-max-30-chars",
+  "projectName": "kebab-case-max-30-chars",
   "files": [
-    {"path": "index.html", "content": "COMPLETE HTML"},
-    {"path": "style.css",  "content": "COMPLETE CSS"},
-    {"path": "script.js",  "content": "COMPLETE JS"}
+    {"path": "index.html", "content": "...FULL COMPLETE HTML..."},
+    {"path": "style.css",  "content": "...FULL COMPLETE CSS..."},
+    {"path": "script.js",  "content": "...FULL COMPLETE JS..."}
   ]
 }
 
-TECH RULES:
-- Pure vanilla HTML5 + CSS3 + ES6 JS only. No frameworks, no npm, no imports.
-- Tailwind v4 CDN in index.html: <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-- index.html must have: <link rel="stylesheet" href="style.css"> and <script src="script.js"></script>
-- Dark premium UI: glassmorphism, gradients, smooth animations.
-- Arabic request → dir="rtl" lang="ar" on <html>, Cairo font from Google Fonts.
-- Games/apps → 100% working logic. No stubs. No TODOs. Everything functional.
-- Implement EVERY feature the user mentions. Nothing skipped."""
+TECHNOLOGY RULES:
+- Pure vanilla HTML5 + CSS3 + ES6 JS ONLY
+- NO React, NO Vue, NO npm, NO imports, NO require()
+- Tailwind v4 via CDN ALWAYS in index.html head:
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+- index.html MUST have:
+  <link rel="stylesheet" href="style.css">
+  <script src="script.js"></script> before </body>
 
-BUILD_PROMPT = """Build a complete production-ready web app. Implement every feature fully.
+DESIGN REQUIREMENTS — MANDATORY:
+- Create STUNNING, PREMIUM, PRODUCTION-READY interfaces
+- Use: multi-stop mesh gradients, glassmorphism (backdrop-blur-xl), neon glow effects
+- Smooth CSS animations and transitions on everything
+- Hover states, active states, focus states on all interactive elements
+- Professional typography with Google Fonts
+- Fully responsive (mobile-first)
+- Dark theme by default unless user specifies otherwise
+- NO plain/boring/basic designs — every element must look premium
 
-Request: {request}"""
+ARABIC LANGUAGE RULE:
+- If request is in Arabic OR targets Arabic users:
+  * <html lang="ar" dir="rtl">
+  * Google Font: Cairo or Tajawal
+  * Full RTL layout
 
-EDIT_PROMPT = """Update this web project. Apply every requested change. Keep untouched features intact.
+CONTENT & FEATURES RULES — CRITICAL:
+- READ the user request CAREFULLY
+- Implement EVERY feature mentioned — nothing skipped, nothing stubbed
+- Add REALISTIC placeholder content (real product names, real prices, real descriptions)
+- For stores: add real-looking products with images from picsum.photos
+- For games: 100% working gameplay, scoring, win/lose conditions
+- For dashboards: real charts using Chart.js from CDN, real-looking data
+- Write AT LEAST 200 lines of HTML, 100 lines of CSS, 150 lines of JS
+- The result must look like a REAL website a professional company would use
 
-Current code:
+FORBIDDEN:
+- Empty or placeholder content like "Product 1", "Lorem ipsum", "TODO"
+- Basic unstyled pages
+- Missing features the user asked for
+- Stub functions with no implementation"""
+
+BUILD_PROMPT = """Build a complete, stunning, production-ready website for this request.
+
+USER REQUEST: {request}
+
+REQUIREMENTS:
+1. Implement EVERY feature the user mentioned with full working logic
+2. Add realistic content — real product names, descriptions, prices if it's a store
+3. Make it look PREMIUM and PROFESSIONAL — not a basic template
+4. Arabic request = RTL + Cairo font + Arabic content throughout
+5. Minimum: 200 lines HTML, 100 lines CSS, 150 lines JS
+
+Return ONLY the JSON object."""
+
+EDIT_PROMPT = """Update this existing web project with the requested changes.
+
+CURRENT CODE:
 {current_code}
 
-Changes to apply:
-{edit_request}"""
+CHANGES REQUESTED: {edit_request}
 
-# JSON config يجبر Gemini يرجع JSON نظيف دائماً
-JSON_CONFIG = types.GenerateContentConfig(
-    response_mime_type="application/json",
-    temperature=0.7,
-)
+RULES:
+- Apply EVERY requested change completely
+- Keep ALL existing features that weren't mentioned for removal
+- Maintain the same design quality and style
+- Return ALL 3 files complete even if only one changed
+
+Return ONLY the JSON object."""
 
 
 def _validate(data: dict) -> None:
@@ -64,36 +112,79 @@ def _validate(data: dict) -> None:
     if missing:
         raise ValueError(f"Missing files: {missing}")
     for f in data["files"]:
-        if not f.get("content", "").strip():
-            raise ValueError(f"Empty content: {f.get('path')}")
+        if len(f.get("content", "").strip()) < 50:
+            raise ValueError(f"Content too short in {f.get('path')}")
 
 
-def _call(prompt: str, retries: int = 4) -> str:
+def _extract_json(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"```$", "", text).strip()
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("No { found")
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if esc:
+            esc = False
+            continue
+        if c == "\\" and in_str:
+            esc = True
+            continue
+        if c == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i+1]
+    end = text.rfind("}")
+    if end > start:
+        return text[start:end+1]
+    raise ValueError("No matching }")
+
+
+def _fix_json(text: str) -> str:
+    return re.sub(r",(\s*[}\]])", r"\1", text)
+
+
+def _call(prompt: str, retries: int = 5) -> str:
     last_err = last_raw = None
-    full_prompt = BASE_SYSTEM + "\n\n" + prompt
+    messages = [
+        {"role": "system", "content": BASE_SYSTEM},
+        {"role": "user", "content": prompt},
+    ]
 
     for i in range(1, retries + 1):
         try:
-            r = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=full_prompt,
-                config=JSON_CONFIG,
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                temperature=0.8,
+                max_tokens=8000,
+                response_format={"type": "json_object"},
             )
-            last_raw = r.text.strip()
+            last_raw = resp.choices[0].message.content.strip()
+            extracted = _extract_json(last_raw)
 
-            # مع response_mime_type=json الرد دايماً JSON مباشرة
-            # لكن نتأكد على كل حال
-            text = last_raw
-            # أزل أي ```json ``` لو وُجدت
-            text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
-            text = re.sub(r"```$", "", text).strip()
+            try:
+                data = json.loads(extracted)
+            except json.JSONDecodeError:
+                extracted = _fix_json(extracted)
+                data = json.loads(extracted)
 
-            data = json.loads(text)
             _validate(data)
-            return text
+            return extracted
 
         except json.JSONDecodeError as e:
-            last_err = f"JSON parse error attempt {i}: {e}"
+            last_err = f"JSON error attempt {i}: {e}"
         except ValueError as e:
             last_err = f"Validation error attempt {i}: {e}"
         except Exception as e:
@@ -102,7 +193,7 @@ def _call(prompt: str, retries: int = 4) -> str:
         if i < retries:
             time.sleep(2 * i)
 
-    raise RuntimeError(f"Gemini failed after {retries} attempts. Last: {last_err} | raw[:200]={(last_raw or '')[:200]}")
+    raise RuntimeError(f"Groq failed {retries}x. Last: {last_err} | raw[:300]={(last_raw or '')[:300]}")
 
 
 def builder(request: str) -> str:
@@ -111,12 +202,11 @@ def builder(request: str) -> str:
 
 def editor(edit_request: str, current_code: str = "") -> str:
     return _call(EDIT_PROMPT.format(
-        current_code=current_code or "(no source files — treat as new project)",
+        current_code=current_code or "(no source — treat as new project)",
         edit_request=edit_request,
     ))
 
 
-# Legacy aliases
 def planner(text: str) -> str: return builder(text)
 def coder(plan: str) -> str:   return plan
 def reviewer(code: str) -> str: return code
