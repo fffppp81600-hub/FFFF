@@ -27,6 +27,15 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 _cooldown: dict  = {}
 EDIT_MODE: dict  = {}
 USER_STATS: dict = {}
+PENDING_IMAGE: dict = {}  # uid -> {"path": local_path, "url": public_url} — صورة مرسلة بدون نص بانتظار التعليمات
+
+# مجلد رفع الصور — نفس مجلد المواقع اللي يخدمه server.py عبر مسار /s/<name>/<filename>
+SITES_DIR = os.path.join(os.path.dirname(__file__), "sites")
+UPLOADS_DIR = os.path.join(SITES_DIR, "_uploads")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+# الرابط العام للسيرفر (لازم يكون صحيح عشان رابط الصورة يفتح فعلياً داخل الموقع المبني)
+PUBLIC_BASE = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
 
 
 # ── Helpers ───────────────────────────────────
@@ -121,7 +130,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "أرسل وصفاً تفصيلياً لما تريد.\n"
         "مثال: سوّي متجر ملابس بألوان داكنة فيه 3 أقسام وسلة تسوق\n\n"
         "✏️ تعديل موقع:\n"
-        "اضغط زر تعديل تحت الموقع، ثم أرسل ما تريد تغييره.\n\n"
+        "اضغط زر تعديل تحت الموقع، ثم أرسل ما تريد تغييره.\n"
+        "تقدر ترسل صورة وقت التعديل (مع نص أو بدونه) لاستخدامها كلوقو، أو لتطبيق لون "
+        "الصورة على الموقع، أو كصورة لمنتج معيّن.\n\n"
         "💡 نصائح:\n"
         "• كن تفصيلياً في الوصف\n"
         "• حدد الألوان والأقسام\n"
@@ -164,6 +175,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.message.from_user.id)
+    PENDING_IMAGE.pop(uid, None)
     if uid in EDIT_MODE:
         proj = EDIT_MODE.pop(uid)
         await update.message.reply_text(f"❌ تم إلغاء تعديل {proj}.")
@@ -200,7 +212,8 @@ async def _do_build(update: Update, uid: str, text: str):
 
 
 # ── Edit ───────────────────────────────────────
-async def _do_edit(update: Update, uid: str, text: str, proj: str):
+async def _do_edit(update: Update, uid: str, text: str, proj: str,
+                    image_url: str | None = None, image_path: str | None = None):
     await _typing(update)
     await update.message.reply_text(f"🔄 معالجة التعديلات على {proj}...")
 
@@ -217,8 +230,8 @@ async def _do_edit(update: Update, uid: str, text: str, proj: str):
         await update.message.reply_text("⚠️ لم أجد الملفات، سيُعامَل كمشروع جديد.")
 
     try:
-        log(f"[EDIT] uid={uid} proj={proj} req={text[:100]}")
-        data = safe_parse(editor(text, current_code=current))
+        log(f"[EDIT] uid={uid} proj={proj} req={text[:100]} img={'yes' if image_url else 'no'}")
+        data = safe_parse(editor(text, current_code=current, image_url=image_url, image_path=image_path))
         if not data:
             raise ValueError("safe_parse=None")
         data["projectName"] = proj
@@ -258,6 +271,63 @@ async def _do_deploy(update: Update, uid: str, data: dict):
         await update.message.reply_text("❌ فشل الرفع. تحقق من إعدادات السيرفر.")
 
 
+# ── Image upload ────────────────────────────────
+async def _save_photo(update: Update, uid: str) -> dict | None:
+    """يحمّل أعلى دقة من الصورة المرسلة محلياً، ويبني رابطها العام عبر مسار /s/_uploads/ الذي يخدمه server.py."""
+    try:
+        photo = update.message.photo[-1]
+        tg_file = await photo.get_file()
+        filename = f"{uid}_{int(time.time())}.jpg"
+        local_path = os.path.join(UPLOADS_DIR, filename)
+        await tg_file.download_to_drive(local_path)
+
+        if not PUBLIC_BASE:
+            log(f"[IMG_WARN] uid={uid} PUBLIC_URL/RENDER_EXTERNAL_URL غير مضبوط — لن يتولّد رابط عام صالح")
+            return {"path": local_path, "url": ""}
+
+        url = f"{PUBLIC_BASE.rstrip('/')}/s/_uploads/{filename}"
+        log(f"[IMG_OK] uid={uid} url={url}")
+        return {"path": local_path, "url": url}
+    except Exception as e:
+        log(f"[IMG_ERR] uid={uid} err={e}")
+        return None
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.message.from_user.id)
+
+    if uid not in EDIT_MODE:
+        await update.message.reply_text(
+            "📸 استلمت الصورة، لكن الصور تُستخدم فقط أثناء تعديل موقع موجود.\n"
+            "اضغط زر ✏️ تعديل تحت موقعك، ثم أرسل الصورة."
+        )
+        return
+
+    saved = await _save_photo(update, uid)
+    if not saved or not saved["url"]:
+        await update.message.reply_text(
+            "⚠️ تعذّر حفظ الصورة أو توليد رابط عام لها. "
+            "تأكد إن متغيّر PUBLIC_URL (أو RENDER_EXTERNAL_URL) مضبوط بالسيرفر."
+        )
+        return
+
+    caption = (update.message.caption or "").strip()
+
+    if caption:
+        # صورة + تعليمات بنفس الرسالة → تنفيذ التعديل فوراً
+        proj = EDIT_MODE.pop(uid)
+        data = await _do_edit(update, uid, caption, proj, image_url=saved["url"], image_path=saved["path"])
+        if data:
+            await _do_deploy(update, uid, data)
+    else:
+        # صورة بدون نص → تُخزَّن وتُربط تلقائياً بالرسالة النصية القادمة
+        PENDING_IMAGE[uid] = saved
+        await update.message.reply_text(
+            "📸 استلمت الصورة. أرسل الآن وصف كيف تريد استخدامها:\n"
+            "مثلاً: خلي اللوقو هذي الصورة / لون الصفحة نفس لون الصورة / هذا المنتج حط له هذي الصورة."
+        )
+
+
 # ── Main message handler ───────────────────────
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = str(update.message.from_user.id)
@@ -274,7 +344,12 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if uid in EDIT_MODE:
         proj = EDIT_MODE.pop(uid)
-        data = await _do_edit(update, uid, text, proj)
+        pending = PENDING_IMAGE.pop(uid, None)
+        if pending:
+            data = await _do_edit(update, uid, text, proj,
+                                   image_url=pending["url"], image_path=pending["path"])
+        else:
+            data = await _do_edit(update, uid, text, proj)
     else:
         data = await _do_build(update, uid, text)
 
@@ -301,7 +376,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         EDIT_MODE[uid] = proj
         await q.message.reply_text(
             f"✏️ وضع تعديل: {proj}\n\n"
-            f"أرسل الآن التغييرات التي تريدها بالتفصيل.\n"
+            f"أرسل الآن التغييرات التي تريدها بالتفصيل، أو أرسل صورة (مع وصف أو بدونه).\n"
             f"للإلغاء: /cancel"
         )
 
@@ -336,6 +411,7 @@ app.add_handler(CommandHandler("help",   cmd_help))
 app.add_handler(CommandHandler("my",     cmd_my))
 app.add_handler(CommandHandler("stats",  cmd_stats))
 app.add_handler(CommandHandler("cancel", cmd_cancel))
+app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 app.add_handler(CallbackQueryHandler(handle_callback))
 
