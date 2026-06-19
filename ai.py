@@ -61,17 +61,41 @@ CONTENT & FEATURES RULES — CRITICAL:
 - READ the user request CAREFULLY
 - Implement EVERY feature mentioned — nothing skipped, nothing stubbed
 - Add REALISTIC placeholder content (real product names, real prices, real descriptions)
-- For stores: add real-looking products with images from picsum.photos
+- For stores: add real-looking products with real photo URLs from https://picsum.photos/seed/SEEDNAME/400/500 (use a unique seed per product so each photo differs, e.g. picsum.photos/seed/tshirt1/400/500)
 - For games: 100% working gameplay, scoring, win/lose conditions
 - For dashboards: real charts using Chart.js from CDN, real-looking data
-- Write AT LEAST 200 lines of HTML, 100 lines of CSS, 150 lines of JS
+- Write AT LEAST 200 lines of HTML, 100 lines of CSS, 300 lines of JS for e-commerce sites
 - The result must look like a REAL website a professional company would use
+
+E-COMMERCE SITES — MANDATORY WORKING LOGIC (read carefully, this is the #1 failure point):
+- Store ALL products in a single JS array of objects: {id, name, category, price, image}
+- Category filtering: each category button/tab MUST have a data-category attribute or onclick that calls a function like showCategory('tshirts') which:
+  1. Loops through ALL product cards
+  2. Shows only cards whose category matches, hides all others (display:none / display:block, or filter the array and re-render)
+  3. NEVER hardcode separate static HTML sections per category that don't connect to the filter buttons — the buttons MUST control visibility of ALL products, every category must work identically
+- Shopping cart MUST be real working state:
+  1. Maintain a JS array `cart = []` (or use a global object) in script.js
+  2. "Add to cart" button onclick MUST push the product into `cart` and call `updateCartUI()` and `updateCartCount()`
+  3. A cart icon fixed top-left (like Salla-style) shows a badge with item count, updates live on every add
+  4. Clicking the cart icon opens a cart panel/modal/sidebar showing all added products with quantity, price, remove button, and subtotal
+  5. Cart panel MUST have a "إتمام الشراء" / "Checkout" button that navigates to or reveals the checkout section
+- Checkout flow MUST work end-to-end:
+  1. Checkout section/page has an input field for delivery address/location ("موقعك")
+  2. Checkout shows order summary (items from cart, total price)
+  3. Checkout offers payment method selection: at minimum an "Apple Pay" styled button (black, rounded, with the Apple logo using a unicode  character or inline SVG, official Apple Pay look) and a "بطاقة ائتمان" option
+  4. Clicking the Apple Pay button shows a realistic Apple Pay UI simulation (sheet/modal sliding up, dark background, "Pay with Apple Pay" text, then a fake processing spinner, then a success checkmark screen) — this is a VISUAL SIMULATION for demo purposes only, never claim real payment processing in the UI text, but make the simulation look polished and convincing
+  5. After "payment", show a clear order confirmation screen/message
+  6. Every step (cart → checkout → payment → confirmation) must be reachable by clicking through the UI with NO dead buttons and NO console errors
+- TEST YOUR OWN LOGIC MENTALLY: every category tab must show different filtered products, every add-to-cart must visibly increment the cart badge, every cart item must be removable, checkout must always be reachable from the cart
 
 FORBIDDEN:
 - Empty or placeholder content like "Product 1", "Lorem ipsum", "TODO"
 - Basic unstyled pages
 - Missing features the user asked for
-- Stub functions with no implementation"""
+- Stub functions with no implementation
+- Category buttons that don't filter correctly (this is the most common bug — avoid it)
+- Add-to-cart buttons that don't update any visible cart state
+- Claiming real payment processing happens (always keep Apple Pay as a visual-only simulation)"""
 
 BUILD_PROMPT = """Build a complete, stunning, production-ready website for this request.
 
@@ -82,7 +106,8 @@ REQUIREMENTS:
 2. Add realistic content — real product names, descriptions, prices if it's a store
 3. Make it look PREMIUM and PROFESSIONAL — not a basic template
 4. Arabic request = RTL + Cairo font + Arabic content throughout
-5. Minimum: 200 lines HTML, 100 lines CSS, 150 lines JS
+5. If this is a store/e-commerce site: category filters MUST actually filter products live, cart MUST actually track added items with a visible counter, and checkout MUST be reachable from the cart with a working (simulated) payment flow including Apple Pay visual style
+6. Minimum: 200 lines HTML, 100 lines CSS, 250+ lines JS for stores
 
 Return ONLY the JSON object."""
 
@@ -167,8 +192,8 @@ def _call(prompt: str, retries: int = 5) -> str:
             resp = client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
-                temperature=0.8,
-                max_tokens=8000,
+                temperature=0.7,
+                max_tokens=16000,
                 response_format={"type": "json_object"},
             )
             last_raw = resp.choices[0].message.content.strip()
@@ -181,6 +206,13 @@ def _call(prompt: str, retries: int = 5) -> str:
                 data = json.loads(extracted)
 
             _validate(data)
+
+            # فحص جودة إضافي للمتاجر — تأكد إن منطق السلة/الفلترة موجود فعلياً
+            if _looks_like_store(prompt):
+                js_content = next((f["content"] for f in data["files"] if f["path"] == "script.js"), "")
+                if not _has_cart_logic(js_content):
+                    raise ValueError("متجر بدون منطق سلة حقيقي في script.js — إعادة المحاولة")
+
             return extracted
 
         except json.JSONDecodeError as e:
@@ -194,6 +226,18 @@ def _call(prompt: str, retries: int = 5) -> str:
             time.sleep(2 * i)
 
     raise RuntimeError(f"Groq failed {retries}x. Last: {last_err} | raw[:300]={(last_raw or '')[:300]}")
+
+
+def _looks_like_store(prompt: str) -> bool:
+    keywords = ["متجر", "محل", "منتج", "سلة", "تسوق", "store", "shop", "cart", "product"]
+    return any(k in prompt for k in keywords)
+
+
+def _has_cart_logic(js: str) -> bool:
+    """تحقق سريع إن فيه مصفوفة سلة ودوال تحديثها — مو فقط زر بلا منطق."""
+    markers = ["cart", "addToCart", "Cart", "السلة"]
+    hits = sum(1 for m in markers if m in js)
+    return hits >= 2 and len(js) > 800
 
 
 def builder(request: str) -> str:
