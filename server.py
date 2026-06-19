@@ -1,87 +1,47 @@
 """
-store.py — قاعدة بيانات SQLite دائمة لحفظ المشاريع وملفاتها.
-يحل مشكلة فقدان المواقع عند إعادة تشغيل Render.
+server.py — يشغل Flask في thread ثانوي والبوت في الـ main thread.
+يستعيد كل المواقع من قاعدة البيانات عند كل بدء تشغيل (يحل مشكلة فقدان الملفات).
 """
 import os
-import sqlite3
-import json
-from contextlib import contextmanager
+import threading
+from flask import Flask, send_from_directory, abort
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "data.db")
+SITES_DIR = os.path.join(os.path.dirname(__file__), "sites")
+os.makedirs(SITES_DIR, exist_ok=True)
 
+app = Flask(__name__)
 
-@contextmanager
-def _conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+@app.route("/s/<name>/")
+@app.route("/s/<name>/<path:filename>")
+def serve_site(name, filename="index.html"):
+    site_dir = os.path.join(SITES_DIR, name)
+    if not os.path.exists(site_dir):
+        abort(404)
+    return send_from_directory(site_dir, filename)
 
+@app.route("/")
+def home():
+    return "🤖 Bot is running!", 200
 
-def init_db():
-    with _conn() as c:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS projects (
-                user_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                url TEXT NOT NULL,
-                files TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user_id, name)
-            )
-        """)
+@app.route("/health")
+def health():
+    return "OK", 200
 
+def run_flask():
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
-init_db()
+if __name__ == "__main__":
+    # استرجع كل المواقع المحفوظة في قاعدة البيانات إلى القرص
+    from deploy import restore_all_sites_from_db
+    restore_all_sites_from_db()
 
+    # Flask في thread ثانوي
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
 
-def add_project(user_id: str, name: str, url: str, files: list = None):
-    """حفظ مشروع جديد مع ملفاته (files كقائمة dicts)."""
-    with _conn() as c:
-        c.execute(
-            "INSERT OR REPLACE INTO projects (user_id, name, url, files) VALUES (?, ?, ?, ?)",
-            (str(user_id), name, url, json.dumps(files or []))
-        )
-
-
-def get_projects(user_id: str) -> list:
-    """رجّع كل مشاريع المستخدم (بدون الملفات، فقط الاسم والرابط)."""
-    with _conn() as c:
-        rows = c.execute(
-            "SELECT name, url FROM projects WHERE user_id = ? ORDER BY created_at DESC",
-            (str(user_id),)
-        ).fetchall()
-        return [{"name": r["name"], "url": r["url"]} for r in rows]
-
-
-def get_project_files_db(user_id: str, name: str) -> list:
-    """رجّع ملفات مشروع معين من قاعدة البيانات."""
-    with _conn() as c:
-        row = c.execute(
-            "SELECT files FROM projects WHERE user_id = ? AND name = ?",
-            (str(user_id), name)
-        ).fetchone()
-        if not row:
-            return []
-        return json.loads(row["files"])
-
-
-def delete_project(user_id: str, name: str):
-    with _conn() as c:
-        c.execute(
-            "DELETE FROM projects WHERE user_id = ? AND name = ?",
-            (str(user_id), name)
-        )
-
-
-def get_all_projects() -> list:
-    """يستخدمه السيرفر لإعادة كتابة كل المواقع على القرص بعد كل إعادة تشغيل."""
-    with _conn() as c:
-        rows = c.execute("SELECT user_id, name, url, files FROM projects").fetchall()
-        return [
-            {"user_id": r["user_id"], "name": r["name"], "url": r["url"], "files": json.loads(r["files"])}
-            for r in rows
-        ]
+    # البوت في الـ main thread
+    from bot import app as telegram_app
+    from logger import log
+    log("✅ البوت يعمل...")
+    telegram_app.run_polling()
