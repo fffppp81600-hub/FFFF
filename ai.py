@@ -14,6 +14,7 @@ import os
 import re
 import json
 import time
+from typing import Optional
 from dotenv import load_dotenv
 from groq import Groq
 
@@ -170,7 +171,7 @@ def classify_edit_intent(edit_request: str) -> str:
     return "feature_or_content"
 
 
-def extract_dominant_color(image_path: str) -> str | None:
+def extract_dominant_color(image_path: str) -> Optional[str]:
     """
     يستخرج اللون السائد من صورة محلية (مسار ملف على القرص) كـ hex code.
     الموديل (llama-3.3-70b) نصي بالكامل ولا يستطيع "رؤية" الصورة، لذلك أي طلب من نوع
@@ -191,7 +192,7 @@ def extract_dominant_color(image_path: str) -> str | None:
         return None
 
 
-def _build_image_instruction(image_url: str | None, image_path: str | None) -> str:
+def _build_image_instruction(image_url: Optional[str], image_path: Optional[str]) -> str:
     """يبني بلوك تعليمات واضح للـ AI عن الصورة المرفقة (رابط + لون سائد إن وُجد)."""
     if not image_url:
         return ""
@@ -340,8 +341,8 @@ def builder(request: str) -> str:
 def editor(
     edit_request: str,
     current_code: str = "",
-    image_url: str | None = None,
-    image_path: str | None = None,
+    image_url: Optional[str] = None,
+    image_path: Optional[str] = None,
 ) -> str:
     """
     image_url: رابط عام (دائم وقابل للتحميل) للصورة التي أرسلها المستخدم بالتيليجرام —
