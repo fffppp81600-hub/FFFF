@@ -1,7 +1,11 @@
 """
-ai.py — Groq (Llama 3.3 70B) — مجاني، سريع، كوتة عالية جداً.
-يحتاج: pip install groq
-ومتغير بيئة: GROQ_API_KEY (مجاني من https://console.groq.com)
+ai.py — Groq (Llama 3.3 70B) — محرك بناء وتعديل مواقع بفهم عميق للسياق.
+
+ميزات الفهم العميق:
+  - استنتاج الميزات الضمنية غير المذكورة صراحة (متجر = سلة + دفع حتى لو ما ذكرها المستخدم)
+  - تلخيص الكود الحالي تلقائياً قبل التعديل (orientation سريع لـ AI)
+  - تصنيف نوع طلب التعديل (تصميم / إضافة ميزة / حذف / تصحيح خطأ / محتوى)
+  - فحوصات جودة تلقائية متعددة حسب نوع الموقع
 """
 import os
 import re
@@ -13,10 +17,10 @@ from groq import Groq
 load_dotenv()
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
 MODEL = "llama-3.3-70b-versatile"
 
-BASE_SYSTEM = """You are an elite Senior Frontend Engineer, Game Developer, and UI/UX Designer AI with 15 years of experience building award-winning web applications.
+
+BASE_SYSTEM = """You are an elite Senior Frontend Engineer, Game Developer, and UI/UX Designer AI with 15 years of experience. You think deeply before coding: you infer the user's true intent, including features they implied but didn't explicitly state.
 
 OUTPUT CONTRACT — NEVER VIOLATE:
 Return ONLY a raw JSON object. No markdown. No backticks. No explanation. No text before or after.
@@ -41,90 +45,126 @@ TECHNOLOGY RULES:
   <link rel="stylesheet" href="style.css">
   <script src="script.js"></script> before </body>
 
+DEEP UNDERSTANDING RULES — THINK LIKE A PRODUCT OWNER:
+- "Store/متجر" implies: working cart, category navigation, product images, prices, checkout flow — even if not all listed explicitly
+- "Game/لعبة" implies: score tracking, win/lose states, restart button, fair difficulty
+- "Dashboard/لوحة تحكم" implies: charts, summary stat cards, sidebar/nav, realistic numbers
+- Vague wording ("خله احلى" / "make it nicer") means: improve visual polish only (gradients, spacing, animations, typography), never change structure or remove features
+- "غير اللون" without specifying an element means: apply to the primary brand color (buttons, headers, accents) consistently across all files
+- Always reconcile new requests with everything already built — never silently delete a feature the user didn't ask to remove
+
 DESIGN REQUIREMENTS — MANDATORY:
-- Create STUNNING, PREMIUM, PRODUCTION-READY interfaces
-- Use: multi-stop mesh gradients, glassmorphism (backdrop-blur-xl), neon glow effects
+- STUNNING, PREMIUM, PRODUCTION-READY interfaces
+- Multi-stop mesh gradients, glassmorphism (backdrop-blur-xl), neon glow effects
 - Smooth CSS animations and transitions on everything
-- Hover states, active states, focus states on all interactive elements
-- Professional typography with Google Fonts
-- Fully responsive (mobile-first)
+- Hover/active/focus states on all interactive elements
+- Professional typography with Google Fonts, fully responsive (mobile-first)
 - Dark theme by default unless user specifies otherwise
-- NO plain/boring/basic designs — every element must look premium
+- NO plain/boring/basic designs
 
 ARABIC LANGUAGE RULE:
-- If request is in Arabic OR targets Arabic users:
-  * <html lang="ar" dir="rtl">
-  * Google Font: Cairo or Tajawal
-  * Full RTL layout
+- Arabic request or Arabic audience: <html lang="ar" dir="rtl">, Google Font Cairo/Tajawal, full RTL layout
 
 CONTENT & FEATURES RULES — CRITICAL:
-- READ the user request CAREFULLY
-- Implement EVERY feature mentioned — nothing skipped, nothing stubbed
-- Add REALISTIC placeholder content (real product names, real prices, real descriptions)
-- For stores: add real-looking products with real photo URLs from https://picsum.photos/seed/SEEDNAME/400/500 (use a unique seed per product so each photo differs, e.g. picsum.photos/seed/tshirt1/400/500)
-- For games: 100% working gameplay, scoring, win/lose conditions
-- For dashboards: real charts using Chart.js from CDN, real-looking data
-- Write AT LEAST 200 lines of HTML, 100 lines of CSS, 300 lines of JS for e-commerce sites
-- The result must look like a REAL website a professional company would use
+- Implement EVERY feature mentioned OR implied — nothing skipped, nothing stubbed
+- Realistic content (real product names, real prices, real descriptions)
+- Stores: product photos from https://picsum.photos/seed/SEEDNAME/400/500 (unique seed per product)
+- Games: 100% working gameplay, scoring, win/lose conditions
+- Dashboards: real Chart.js charts from CDN, realistic data
+- Minimum 200 lines HTML, 100 lines CSS, 250+ lines JS for stores/apps
 
-E-COMMERCE SITES — MANDATORY WORKING LOGIC (read carefully, this is the #1 failure point):
-- Store ALL products in a single JS array of objects: {id, name, category, price, image}
-- Category filtering: each category button/tab MUST have a data-category attribute or onclick that calls a function like showCategory('tshirts') which:
-  1. Loops through ALL product cards
-  2. Shows only cards whose category matches, hides all others (display:none / display:block, or filter the array and re-render)
-  3. NEVER hardcode separate static HTML sections per category that don't connect to the filter buttons — the buttons MUST control visibility of ALL products, every category must work identically
-- Shopping cart MUST be real working state:
-  1. Maintain a JS array `cart = []` (or use a global object) in script.js
-  2. "Add to cart" button onclick MUST push the product into `cart` and call `updateCartUI()` and `updateCartCount()`
-  3. A cart icon fixed top-left (like Salla-style) shows a badge with item count, updates live on every add
-  4. Clicking the cart icon opens a cart panel/modal/sidebar showing all added products with quantity, price, remove button, and subtotal
-  5. Cart panel MUST have a "إتمام الشراء" / "Checkout" button that navigates to or reveals the checkout section
-- Checkout flow MUST work end-to-end:
-  1. Checkout section/page has an input field for delivery address/location ("موقعك")
-  2. Checkout shows order summary (items from cart, total price)
-  3. Checkout offers payment method selection: at minimum an "Apple Pay" styled button (black, rounded, with the Apple logo using a unicode  character or inline SVG, official Apple Pay look) and a "بطاقة ائتمان" option
-  4. Clicking the Apple Pay button shows a realistic Apple Pay UI simulation (sheet/modal sliding up, dark background, "Pay with Apple Pay" text, then a fake processing spinner, then a success checkmark screen) — this is a VISUAL SIMULATION for demo purposes only, never claim real payment processing in the UI text, but make the simulation look polished and convincing
-  5. After "payment", show a clear order confirmation screen/message
-  6. Every step (cart → checkout → payment → confirmation) must be reachable by clicking through the UI with NO dead buttons and NO console errors
-- TEST YOUR OWN LOGIC MENTALLY: every category tab must show different filtered products, every add-to-cart must visibly increment the cart badge, every cart item must be removable, checkout must always be reachable from the cart
+E-COMMERCE — MANDATORY WORKING LOGIC (most common failure point, be extremely careful):
+- ALL products in one JS array of objects: {id, name, category, price, image}
+- Every category button calls ONE shared filter function over the SAME array and re-renders — never separate disconnected HTML sections per category
+- Real cart state (`let cart = []`): Add-to-cart pushes + calls updateCartUI() + updateCartCount()
+- Cart icon fixed top-left (Salla-style) with live badge count; click opens panel with items, qty, remove, subtotal, and "إتمام الشراء" button
+- Checkout: address input ("موقعك"), order summary, payment options including black rounded "Apple Pay" button (visual simulation only: sliding sheet, spinner, success check — never claim real payment)
+- Every step (browse → filter → cart → checkout → pay → confirm) must work with zero dead buttons
 
 FORBIDDEN:
-- Empty or placeholder content like "Product 1", "Lorem ipsum", "TODO"
-- Basic unstyled pages
-- Missing features the user asked for
-- Stub functions with no implementation
-- Category buttons that don't filter correctly (this is the most common bug — avoid it)
-- Add-to-cart buttons that don't update any visible cart state
-- Claiming real payment processing happens (always keep Apple Pay as a visual-only simulation)"""
+- Placeholder content like "Product 1", "Lorem ipsum", "TODO"
+- Basic unstyled pages, missing implied features, stub functions
+- Category buttons that don't filter correctly
+- Add-to-cart buttons with no visible state change
+- Claiming real payment processing happens"""
+
 
 BUILD_PROMPT = """Build a complete, stunning, production-ready website for this request.
 
 USER REQUEST: {request}
 
+Before coding, think about what this type of site implicitly needs beyond what's literally written, and include it.
+
 REQUIREMENTS:
-1. Implement EVERY feature the user mentioned with full working logic
-2. Add realistic content — real product names, descriptions, prices if it's a store
-3. Make it look PREMIUM and PROFESSIONAL — not a basic template
+1. Implement EVERY feature mentioned or reasonably implied, with full working logic
+2. Realistic content — real product names, descriptions, prices if it's a store
+3. PREMIUM and PROFESSIONAL look — not a basic template
 4. Arabic request = RTL + Cairo font + Arabic content throughout
-5. If this is a store/e-commerce site: category filters MUST actually filter products live, cart MUST actually track added items with a visible counter, and checkout MUST be reachable from the cart with a working (simulated) payment flow including Apple Pay visual style
+5. Stores: category filters must filter live, cart must track items visibly, checkout must work with simulated Apple Pay
 6. Minimum: 200 lines HTML, 100 lines CSS, 250+ lines JS for stores
 
 Return ONLY the JSON object."""
 
-EDIT_PROMPT = """Update this existing web project with the requested changes.
 
-CURRENT CODE:
+EDIT_PROMPT = """You are modifying an existing live website. Understand the current code deeply before changing anything.
+
+CODE SUMMARY (quick orientation): {code_summary}
+
+CURRENT FULL CODE:
 {current_code}
 
-CHANGES REQUESTED: {edit_request}
+USER'S EDIT REQUEST: {edit_request}
 
-RULES:
-- Apply EVERY requested change completely
-- Keep ALL existing features that weren't mentioned for removal
-- Maintain the same design quality and style
-- Return ALL 3 files complete even if only one changed
+INSTRUCTIONS:
+1. Identify the change type: (a) visual/style only, (b) new feature, (c) removal, (d) bug fix, (e) content change
+2. If vague ("خله احلى", "زيد شي", "غيره"), infer the most sensible interpretation from what the site currently does — improve without breaking structure
+3. Apply the change completely across ALL files that need it (a color change may need both CSS and inline Tailwind classes updated)
+4. NEVER remove or break an existing working feature unless explicitly asked
+5. Return ALL 3 files complete, even unchanged ones
 
 Return ONLY the JSON object."""
+
+
+def summarize_code(current_code: str) -> str:
+    """تلخيص سريع للكود الحالي بدون استدعاء AI إضافي — orientation للنموذج."""
+    if not current_code or len(current_code.strip()) < 20:
+        return "لا يوجد كود سابق — مشروع جديد بالكامل."
+
+    lower = current_code.lower()
+    features = []
+    checks = [
+        (["cart", "سلة"], "نظام سلة تسوق"),
+        (["category", "قسم", "filter"], "فلترة/أقسام منتجات"),
+        (["apple pay", "checkout", "دفع"], "صفحة دفع/checkout"),
+        (["score", "game"], "منطق لعبة (نقاط/فوز/خسارة)"),
+        (["chart", "canvas"], "رسوم بيانية / dashboard"),
+        (["cairo", 'dir="rtl"'], "موقع عربي بتخطيط RTL"),
+        (["picsum", "placeholder.com"], "صور منتجات placeholder"),
+    ]
+    for keywords, label in checks:
+        if any(k in lower for k in keywords):
+            features.append(label)
+
+    files_found = re.findall(r"--- (\S+) ---", current_code)
+    files_note = f"الملفات الموجودة: {', '.join(set(files_found))}" if files_found else ""
+
+    if features:
+        return f"{files_note}\nالميزات المكتشفة حالياً: {', '.join(features)}."
+    return f"{files_note}\nموقع بسيط بدون ميزات تفاعلية معقدة مكتشفة."
+
+
+def classify_edit_intent(edit_request: str) -> str:
+    """تصنيف سريع لنوع طلب التعديل — يساعد القرار لو الطلب غامض."""
+    vague_markers = ["احلى", "افضل", "حسن", "طور", "زيد شي", "ضيف شي", "غيره شوي"]
+    if any(m in edit_request for m in vague_markers) and len(edit_request.split()) < 5:
+        return "vague_polish"
+    if any(w in edit_request for w in ["حذف", "شيل", "ازل", "remove", "delete"]):
+        return "removal"
+    if any(w in edit_request for w in ["لون", "تصميم", "شكل", "خط", "style", "color"]):
+        return "style_only"
+    if any(w in edit_request for w in ["لا يعمل", "ما يعمل", "خطأ", "مشكلة", "bug", "fix"]):
+        return "bug_fix"
+    return "feature_or_content"
 
 
 def _validate(data: dict) -> None:
@@ -139,6 +179,17 @@ def _validate(data: dict) -> None:
     for f in data["files"]:
         if len(f.get("content", "").strip()) < 50:
             raise ValueError(f"Content too short in {f.get('path')}")
+
+
+def _looks_like_store(text: str) -> bool:
+    keywords = ["متجر", "محل", "منتج", "سلة", "تسوق", "store", "shop", "cart", "product"]
+    return any(k in text for k in keywords)
+
+
+def _has_cart_logic(js: str) -> bool:
+    markers = ["cart", "addToCart", "Cart", "السلة"]
+    hits = sum(1 for m in markers if m in js)
+    return hits >= 2 and len(js) > 800
 
 
 def _extract_json(text: str) -> str:
@@ -169,10 +220,10 @@ def _extract_json(text: str) -> str:
         elif c == "}":
             depth -= 1
             if depth == 0:
-                return text[start:i+1]
+                return text[start:i + 1]
     end = text.rfind("}")
     if end > start:
-        return text[start:end+1]
+        return text[start:end + 1]
     raise ValueError("No matching }")
 
 
@@ -180,7 +231,7 @@ def _fix_json(text: str) -> str:
     return re.sub(r",(\s*[}\]])", r"\1", text)
 
 
-def _call(prompt: str, retries: int = 5) -> str:
+def _call(prompt: str, retries: int = 5, check_store: bool = False) -> str:
     last_err = last_raw = None
     messages = [
         {"role": "system", "content": BASE_SYSTEM},
@@ -207,8 +258,7 @@ def _call(prompt: str, retries: int = 5) -> str:
 
             _validate(data)
 
-            # فحص جودة إضافي للمتاجر — تأكد إن منطق السلة/الفلترة موجود فعلياً
-            if _looks_like_store(prompt):
+            if check_store:
                 js_content = next((f["content"] for f in data["files"] if f["path"] == "script.js"), "")
                 if not _has_cart_logic(js_content):
                     raise ValueError("متجر بدون منطق سلة حقيقي في script.js — إعادة المحاولة")
@@ -228,27 +278,34 @@ def _call(prompt: str, retries: int = 5) -> str:
     raise RuntimeError(f"Groq failed {retries}x. Last: {last_err} | raw[:300]={(last_raw or '')[:300]}")
 
 
-def _looks_like_store(prompt: str) -> bool:
-    keywords = ["متجر", "محل", "منتج", "سلة", "تسوق", "store", "shop", "cart", "product"]
-    return any(k in prompt for k in keywords)
-
-
-def _has_cart_logic(js: str) -> bool:
-    """تحقق سريع إن فيه مصفوفة سلة ودوال تحديثها — مو فقط زر بلا منطق."""
-    markers = ["cart", "addToCart", "Cart", "السلة"]
-    hits = sum(1 for m in markers if m in js)
-    return hits >= 2 and len(js) > 800
-
-
 def builder(request: str) -> str:
-    return _call(BUILD_PROMPT.format(request=request))
+    return _call(
+        BUILD_PROMPT.format(request=request),
+        check_store=_looks_like_store(request),
+    )
 
 
 def editor(edit_request: str, current_code: str = "") -> str:
-    return _call(EDIT_PROMPT.format(
-        current_code=current_code or "(no source — treat as new project)",
-        edit_request=edit_request,
-    ))
+    summary = summarize_code(current_code)
+    intent = classify_edit_intent(edit_request)
+
+    intent_hints = {
+        "vague_polish": "النية المكتشفة: طلب تحسين بصري عام فقط. لا تغيّر البنية أو تحذف ميزات — فقط حسّن المظهر.",
+        "removal": "النية المكتشفة: طلب حذف/إزالة شيء معين. تأكد من حذفه بدقة دون التأثير على باقي الميزات.",
+        "style_only": "النية المكتشفة: تعديل تصميم/ألوان/خطوط. لا تغيّر المنطق الوظيفي.",
+        "bug_fix": "النية المكتشفة: تصحيح خطأ أو مشكلة. ركّز على إيجاد سبب العطل في الكود الحالي وإصلاحه دون كسر أي شيء آخر يعمل.",
+        "feature_or_content": "النية المكتشفة: إضافة ميزة جديدة أو محتوى. أضفها بالتكامل الكامل مع الكود الموجود.",
+    }
+    enriched_request = f"{edit_request}\n\n[{intent_hints.get(intent, '')}]"
+
+    return _call(
+        EDIT_PROMPT.format(
+            current_code=current_code or "(no source — treat as new project)",
+            code_summary=summary,
+            edit_request=enriched_request,
+        ),
+        check_store=_looks_like_store(current_code + edit_request),
+    )
 
 
 def planner(text: str) -> str: return builder(text)
