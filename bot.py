@@ -1,19 +1,8 @@
 """
-bot.py — Telegram bot — النسخة المطورة بالكامل.
-
-ميزات جديدة:
-  /help        — شرح كامل
-  /my          — مشاريعك مع أزرار تحكم مباشرة
-  /cancel      — إلغاء التعديل
-  /stats       — إحصائياتك الشخصية
-  وضع التعديل — يحتفظ بمحادثة سياقية (multi-turn)
-  حماية من الفلود — cooldown ذكي
-  رسائل typing — تجربة مستخدم أفضل
-  تقسيم الرسائل — لو الرسالة تتجاوز حد تيليغرام
+bot.py — Telegram bot — يحفظ المشاريع بشكل دائم في قاعدة بيانات.
 """
 import os
 import time
-import json
 from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
@@ -29,20 +18,19 @@ from ai import builder, editor
 from builder import build_project
 from deploy import deploy_project, delete_vercel_project
 from validator import safe_parse
-from store import add_project, get_projects, delete_project
+from store import add_project, get_projects, delete_project, get_project_files_db
 from file_manager import delete_project_files, get_project_files
 from logger import log
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# ── State ─────────────────────────────────────
-_cooldown: dict  = {}   # uid -> last_request_time
-EDIT_MODE: dict  = {}   # uid -> project_name
-USER_STATS: dict = {}   # uid -> {builds, edits, last_active}
+_cooldown: dict  = {}
+EDIT_MODE: dict  = {}
+USER_STATS: dict = {}
 
 
 # ── Helpers ───────────────────────────────────
-def _allow(uid: str, seconds: int = 8) -> bool:
+def _allow(uid: str, seconds: int = 8):
     now = time.time()
     if now - _cooldown.get(uid, 0) < seconds:
         remaining = int(seconds - (now - _cooldown.get(uid, 0)))
@@ -61,28 +49,13 @@ def _track(uid: str, action: str):
 
 
 async def _typing(update: Update):
-    """أرسل إشارة Typing لتحسين تجربة المستخدم."""
     try:
         await update.message.chat.send_action(ChatAction.TYPING)
     except Exception:
         pass
 
 
-def _split_send(text: str, max_len: int = 4000) -> list[str]:
-    """تقسيم رسالة طويلة لأجزاء."""
-    parts = []
-    while len(text) > max_len:
-        cut = text[:max_len].rfind("\n")
-        if cut == -1:
-            cut = max_len
-        parts.append(text[:cut])
-        text = text[cut:].lstrip()
-    parts.append(text)
-    return parts
-
-
 def _fallback(text: str, uid: str) -> dict:
-    """صفحة احتياطية فقط عند فشل الذكاء الاصطناعي كلياً."""
     name = f"site-{uid[-4:]}-{int(time.time()) % 100000}"[:30]
     safe = text.replace('"', "'")[:300]
     html = f"""<!DOCTYPE html>
@@ -132,7 +105,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• ألعاب تفاعلية في المتصفح\n"
         "• لوحات تحكم ودashboards\n"
         "• أي موقع تتخيله!\n\n"
-        "📌 فقط أرسل وصف ما تريد وسأبنيه وأنشره على Vercel فوراً 🚀\n\n"
+        "📌 فقط أرسل وصف ما تريد وسأبنيه وأنشره فوراً 🚀\n\n"
         "الأوامر:\n"
         "/help — شرح مفصل\n"
         "/my — مشاريعك\n"
@@ -143,21 +116,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 *دليل الاستخدام*\n\n"
-        "*🏗 بناء موقع جديد:*\n"
-        "أرسل وصفاً تفصيلياً لما تريد:\n"
-        "مثال: _سوّي متجر ملابس بألوان داكنة فيه 3 أقسام وسلة تسوق_\n\n"
-        "*✏️ تعديل موقع:*\n"
-        "اضغط زر ✏️ تعديل تحت الموقع، ثم أرسل ما تريد تغييره.\n\n"
-        "*💡 نصائح للحصول على أفضل نتيجة:*\n"
+        "📖 دليل الاستخدام\n\n"
+        "🏗 بناء موقع جديد:\n"
+        "أرسل وصفاً تفصيلياً لما تريد.\n"
+        "مثال: سوّي متجر ملابس بألوان داكنة فيه 3 أقسام وسلة تسوق\n\n"
+        "✏️ تعديل موقع:\n"
+        "اضغط زر تعديل تحت الموقع، ثم أرسل ما تريد تغييره.\n\n"
+        "💡 نصائح:\n"
         "• كن تفصيلياً في الوصف\n"
-        "• حدد الألوان والأقسام التي تريدها\n"
-        "• ذكر الميزات المهمة (سلة، دفع، تسجيل...)\n\n"
-        "*⚙️ الأوامر:*\n"
+        "• حدد الألوان والأقسام\n"
+        "• اذكر الميزات المهمة (سلة، دفع، تسجيل...)\n\n"
+        "⚙️ الأوامر:\n"
         "/my — مشاريعك النشطة\n"
         "/stats — إحصائياتك\n"
-        "/cancel — إلغاء وضع التعديل",
-        parse_mode="Markdown"
+        "/cancel — إلغاء وضع التعديل"
     )
 
 
@@ -165,23 +137,14 @@ async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.message.from_user.id)
     projects = get_projects(uid)
     if not projects:
-        await update.message.reply_text(
-            "📭 لا توجد مشاريع نشطة.\n\nأرسل وصف موقعك لإنشاء أول مشروع! 🚀"
-        )
+        await update.message.reply_text("📭 لا توجد مشاريع نشطة.\n\nأرسل وصف موقعك لإنشاء أول مشروع! 🚀")
         return
 
-    await update.message.reply_text(f"📂 *مشاريعك ({len(projects)}):*", parse_mode="Markdown")
-
+    await update.message.reply_text(f"📂 مشاريعك ({len(projects)}):")
     for p in projects:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🌐 افتح", url=p["url"]),
-             InlineKeyboardButton("✏️ تعديل", callback_data=f"edit|{p['name']}"),
-             InlineKeyboardButton("🗑 حذف", callback_data=f"del|{p['name']}")],
-        ])
         await update.message.reply_text(
-            f"📛 `{p['name']}`\n🔗 {p['url']}",
-            reply_markup=kb,
-            parse_mode="Markdown",
+            f"📛 {p['name']}\n🔗 {p['url']}",
+            reply_markup=_project_keyboard(p["name"], p["url"]),
             disable_web_page_preview=True
         )
 
@@ -191,12 +154,11 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = USER_STATS.get(uid, {"builds": 0, "edits": 0, "last_active": "—"})
     projects = get_projects(uid)
     await update.message.reply_text(
-        f"📊 *إحصائياتك:*\n\n"
+        f"📊 إحصائياتك:\n\n"
         f"🏗 مواقع بُنيت: {s['builds']}\n"
         f"✏️ تعديلات: {s['edits']}\n"
         f"📂 مشاريع نشطة: {len(projects)}\n"
-        f"🕐 آخر نشاط: {s['last_active']}",
-        parse_mode="Markdown"
+        f"🕐 آخر نشاط: {s['last_active']}"
     )
 
 
@@ -204,24 +166,21 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.message.from_user.id)
     if uid in EDIT_MODE:
         proj = EDIT_MODE.pop(uid)
-        await update.message.reply_text(f"❌ تم إلغاء تعديل `{proj}`.", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ تم إلغاء تعديل {proj}.")
     else:
         await update.message.reply_text("ℹ️ لست في وضع التعديل حالياً.")
 
 
 # ── Build ──────────────────────────────────────
-async def _do_build(update: Update, uid: str, text: str) -> dict | None:
+async def _do_build(update: Update, uid: str, text: str):
     await _typing(update)
     await update.message.reply_text(
-        "⚙️ *جاري بناء موقعك...*\n\n"
-        "المحرك الذكي يحلل طلبك ويولد الكود 🧠\n"
-        "_(قد يستغرق 15-40 ثانية)_",
-        parse_mode="Markdown"
+        "⚙️ جاري بناء موقعك...\n"
+        "المحرك الذكي يحلل طلبك ويولد الكود 🧠"
     )
     try:
         log(f"[BUILD] uid={uid} req={text[:100]}")
-        raw = builder(text)
-        data = safe_parse(raw)
+        data = safe_parse(builder(text))
         if not data:
             raise ValueError("safe_parse=None")
         _track(uid, "build")
@@ -241,27 +200,25 @@ async def _do_build(update: Update, uid: str, text: str) -> dict | None:
 
 
 # ── Edit ───────────────────────────────────────
-async def _do_edit(update: Update, uid: str, text: str, proj: str) -> dict | None:
+async def _do_edit(update: Update, uid: str, text: str, proj: str):
     await _typing(update)
-    await update.message.reply_text(
-        f"🔄 *معالجة التعديلات على* `{proj}`...",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text(f"🔄 معالجة التعديلات على {proj}...")
 
+    # أولاً جرّب من القرص، وإلا من قاعدة البيانات
     local = get_project_files(uid, proj)
+    if not local:
+        local = get_project_files_db(uid, proj)
+
     current = ""
     if local:
         for f in local:
             current += f"\n--- {f['path']} ---\n{f['content']}\n"
     else:
-        await update.message.reply_text(
-            "⚠️ لم أجد الملفات محلياً، سيُعامَل كمشروع جديد.",
-        )
+        await update.message.reply_text("⚠️ لم أجد الملفات، سيُعامَل كمشروع جديد.")
 
     try:
         log(f"[EDIT] uid={uid} proj={proj} req={text[:100]}")
-        raw = editor(text, current_code=current)
-        data = safe_parse(raw)
+        data = safe_parse(editor(text, current_code=current))
         if not data:
             raise ValueError("safe_parse=None")
         data["projectName"] = proj
@@ -270,10 +227,7 @@ async def _do_edit(update: Update, uid: str, text: str, proj: str) -> dict | Non
         return data
     except RuntimeError as e:
         log(f"[EDIT_FAIL] uid={uid} err={e}")
-        await update.message.reply_text(
-            "❌ فشل التعديل بعد كل المحاولات.\n"
-            "أرسل /cancel ثم أعد المحاولة بوصف أوضح."
-        )
+        await update.message.reply_text("❌ فشل التعديل بعد كل المحاولات.\nأرسل /cancel ثم أعد المحاولة.")
         return None
     except Exception as e:
         log(f"[EDIT_ERR] uid={uid} err={e}")
@@ -284,11 +238,12 @@ async def _do_edit(update: Update, uid: str, text: str, proj: str) -> dict | Non
 # ── Deploy ─────────────────────────────────────
 async def _do_deploy(update: Update, uid: str, data: dict):
     await _typing(update)
-    await update.message.reply_text("📦 *رفع الملفات إلى Vercel...*", parse_mode="Markdown")
+    await update.message.reply_text("📦 رفع الملفات...")
     try:
         build_project(data, uid)
         url = deploy_project(data["projectName"], data.get("files", []))
-        add_project(uid, data["projectName"], url)
+        # حفظ دائم في قاعدة البيانات (يشمل محتوى الملفات لاسترجاعها بعد إعادة التشغيل)
+        add_project(uid, data["projectName"], url, data.get("files", []))
         log(f"[DEPLOY_OK] uid={uid} proj={data['projectName']} url={url}")
 
         await update.message.reply_text(
@@ -300,14 +255,7 @@ async def _do_deploy(update: Update, uid: str, data: dict):
         )
     except Exception as e:
         log(f"[DEPLOY_ERR] uid={uid} err={e}")
-        await update.message.reply_text(
-            "❌ *فشل الرفع إلى Vercel*\n\n"
-            "الأسباب المحتملة:\n"
-            "• VERCEL_TOKEN منتهي أو خاطئ\n"
-            "• تجاوزت حد المشاريع المجانية (100)\n"
-            "• مشكلة في الاتصال",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("❌ فشل الرفع. تحقق من إعدادات السيرفر.")
 
 
 # ── Main message handler ───────────────────────
@@ -324,7 +272,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⏳ انتظر {remaining} ثانية بين الطلبات.")
         return
 
-    # وضع التعديل
     if uid in EDIT_MODE:
         proj = EDIT_MODE.pop(uid)
         data = await _do_edit(update, uid, text, proj)
@@ -353,39 +300,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "edit":
         EDIT_MODE[uid] = proj
         await q.message.reply_text(
-            f"✏️ *وضع تعديل:* `{proj}`\n\n"
+            f"✏️ وضع تعديل: {proj}\n\n"
             f"أرسل الآن التغييرات التي تريدها بالتفصيل.\n"
-            f"للإلغاء: /cancel",
-            parse_mode="Markdown"
+            f"للإلغاء: /cancel"
         )
 
     elif action == "del":
-        # زر تأكيد الحذف
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ نعم، احذف", callback_data=f"confirm_del|{proj}"),
              InlineKeyboardButton("❌ إلغاء", callback_data=f"cancel_del|{proj}")],
         ])
         await q.message.reply_text(
-            f"⚠️ *هل أنت متأكد من حذف* `{proj}`؟\n\nلا يمكن التراجع عن هذا الإجراء.",
-            reply_markup=kb,
-            parse_mode="Markdown"
+            f"⚠️ هل أنت متأكد من حذف {proj}؟\n\nلا يمكن التراجع عن هذا الإجراء.",
+            reply_markup=kb
         )
 
     elif action == "confirm_del":
-        await q.message.reply_text(f"🗑 جاري حذف `{proj}`...", parse_mode="Markdown")
+        await q.message.reply_text(f"🗑 جاري حذف {proj}...")
         try:
             delete_vercel_project(proj)
         except Exception as e:
-            log(f"[DEL_VERCEL_ERR] proj={proj} err={e}")
+            log(f"[DEL_LOCAL_ERR] proj={proj} err={e}")
         delete_project_files(uid, proj)
-        delete_project(uid, proj)
-        await q.message.reply_text(f"✅ تم حذف `{proj}` بنجاح.", parse_mode="Markdown")
+        delete_project(uid, proj)  # يحذف من قاعدة البيانات أيضاً
+        await q.message.reply_text(f"✅ تم حذف {proj} بنجاح.")
 
     elif action == "cancel_del":
         await q.message.reply_text("↩️ تم إلغاء الحذف.")
-
-    elif action == "copy":
-        pass  # تم حذف زر النسخ
 
 
 # ── Entry point ────────────────────────────────
