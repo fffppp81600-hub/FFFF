@@ -65,3 +65,4 @@ def log_error(message: str):
 def log_debug(message: str):
     if os.getenv("DEBUG", "").lower() in ("1", "true", "yes"):
         _write("DEBUG", message)
+      
