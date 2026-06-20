@@ -588,3 +588,4 @@ app.add_handler(CallbackQueryHandler(handle_callback))
 if __name__ == "__main__":
     log("✅ البوت يعمل — النسخة المطورة")
     app.run_polling()
+    
