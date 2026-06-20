@@ -30,6 +30,7 @@ _cooldown: dict  = {}
 EDIT_MODE: dict  = {}
 USER_STATS: dict = {}
 PENDING_IMAGE: dict = {}
+PENDING_BUILD: dict = {}  # uid -> {"data": dict, "is_edit": bool, "proj": str|None} — بانتظار تأكيد النشر
 
 SITES_DIR = os.path.join(os.path.dirname(__file__), "sites")
 UPLOADS_DIR = os.path.join(SITES_DIR, "_uploads")
@@ -151,6 +152,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.message.from_user.id)
     PENDING_IMAGE.pop(uid, None)
+    PENDING_BUILD.pop(uid, None)
     if uid in EDIT_MODE:
         proj = EDIT_MODE.pop(uid)
         await update.message.reply_text(f"❌ تم إلغاء تعديل {proj}.")
@@ -211,7 +213,44 @@ async def _do_edit(update: Update, uid: str, text: str, proj: str,
         return None
 
 
+async def _do_preview(update: Update, uid: str, data: dict, is_edit: bool, original_proj: Optional[str] = None):
+    """
+    ينشر الموقع تحت اسم معاينة مؤقت ويعرضه فعلياً قابل للفتح، بدل النشر المباشر بالاسم النهائي.
+    يخزن الـ data بانتظار قرار المستخدم: نشر نهائي (يثبّت بالاسم الحقيقي) أو تعديل (يرجع لوضع التعديل).
+    """
+    await _typing(update)
+    await update.message.reply_text("📦 جاري تحضير معاينة موقعك...")
+    try:
+        preview_name = data["projectName"] if is_edit else f"preview-{data['projectName']}-{int(time.time()) % 10000}"
+        preview_data = {**data, "projectName": preview_name}
+
+        build_project(preview_data, uid)
+        preview_url = deploy_project(preview_name, preview_data.get("files", []))
+
+        PENDING_BUILD[uid] = {
+            "data": data,
+            "is_edit": is_edit,
+            "proj": original_proj,
+            "preview_name": preview_name,
+        }
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌐 افتح المعاينة", url=preview_url)],
+            [InlineKeyboardButton("✅ نشر الموقع", callback_data="confirm_publish"),
+             InlineKeyboardButton("✏️ تعديل أكثر", callback_data="continue_edit")],
+        ])
+        await update.message.reply_text(
+            f"👀 هذي معاينة موقعك — افتحها وشوفها قبل ما تقرر:\n🔗 {preview_url}\n\n"
+            f"إذا عجبتك اضغط «نشر الموقع»، أو «تعديل أكثر» لمواصلة التحسين.",
+            reply_markup=kb,
+        )
+    except Exception as e:
+        log(f"[PREVIEW_ERR] uid={uid} err={e}")
+        await update.message.reply_text("❌ فشل تحضير المعاينة. تحقق من إعدادات السيرفر (BASE_URL).")
+
+
 async def _do_deploy(update: Update, uid: str, data: dict):
+    """نشر نهائي مباشر بالاسم الحقيقي (يُستخدم بعد تأكيد المعاينة، أو يفضل استخدام _do_preview قبله)."""
     await _typing(update)
     await update.message.reply_text("📦 رفع الملفات...")
     try:
@@ -280,7 +319,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _track(uid, "images")
             data = await _do_edit(update, uid, caption, proj, image_url=saved["url"], image_path=saved["path"])
             if data:
-                await _do_deploy(update, uid, data)
+                await _do_preview(update, uid, data, is_edit=True, original_proj=proj)
         else:
             PENDING_IMAGE[uid] = saved
             await update.message.reply_text(
@@ -317,13 +356,16 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data = await _do_edit(update, uid, text, proj, image_url=pending["url"], image_path=pending["path"])
             else:
                 data = await _do_edit(update, uid, text, proj)
+            is_edit = True
         else:
+            proj = None
             data = await _do_build(update, uid, text)
+            is_edit = False
 
         if not data:
             return
 
-        await _do_deploy(update, uid, data)
+        await _do_preview(update, uid, data, is_edit=is_edit, original_proj=proj)
 
     except Exception as e:
         log(f"[HANDLE_FATAL] uid={uid} err={e}")
@@ -337,6 +379,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = str(q.from_user.id)
+
+    # ── أزرار المعاينة (بلا |) ──────────────────
+    if q.data == "confirm_publish":
+        pending = PENDING_BUILD.pop(uid, None)
+        if not pending:
+            await q.message.reply_text("⚠️ لا توجد معاينة بانتظار النشر. أرسل طلب جديد.")
+            return
+        try:
+            data = pending["data"]
+            build_project(data, uid)
+            url = deploy_project(data["projectName"], data.get("files", []))
+            add_project(uid, data["projectName"], url, data.get("files", []))
+            log(f"[PUBLISH_OK] uid={uid} proj={data['projectName']} url={url}")
+            await q.message.reply_text(
+                f"✅ تم النشر النهائي!\n\n📛 الاسم: {data['projectName']}\n🔗 {url}\n\nاستخدم الأزرار 👇",
+                reply_markup=_project_keyboard(data["projectName"], url),
+            )
+        except Exception as e:
+            log(f"[PUBLISH_ERR] uid={uid} err={e}")
+            await q.message.reply_text("❌ فشل النشر النهائي. حاول مرة أخرى.")
+        return
+
+    if q.data == "continue_edit":
+        pending = PENDING_BUILD.get(uid)
+        if not pending:
+            await q.message.reply_text("⚠️ لا توجد معاينة حالية للتعديل عليها. أرسل طلب جديد.")
+            return
+        # نفتح وضع تعديل على نفس مشروع المعاينة المؤقت (preview_name) — التعديل القادم يبني فوقه
+        EDIT_MODE[uid] = pending["preview_name"]
+        await q.message.reply_text(
+            "✏️ تمام، أرسل الآن التغييرات التي تريدها على المعاينة.\n"
+            "بعد التعديل سأعرض لك معاينة جديدة قبل النشر."
+        )
+        return
 
     if "|" not in q.data:
         return
