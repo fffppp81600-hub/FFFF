@@ -86,3 +86,4 @@ def project_exists(user_id: str, name: str) -> bool:
             (str(user_id), name)
         ).fetchone()
         return row is not None
+        
