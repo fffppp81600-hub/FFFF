@@ -16,7 +16,7 @@ from telegram.ext import (
 )
 from telegram.constants import ChatAction
 
-from ai import builder, editor
+from ai import builder, editor, plan_chat, build_from_conversation
 from builder import build_project
 from deploy import deploy_project, delete_vercel_project
 from validator import safe_parse
@@ -30,7 +30,8 @@ _cooldown: dict  = {}
 EDIT_MODE: dict  = {}
 USER_STATS: dict = {}
 PENDING_IMAGE: dict = {}
-PENDING_BUILD: dict = {}  # uid -> {"data": dict, "is_edit": bool, "proj": str|None} — بانتظار تأكيد النشر
+PENDING_BUILD: dict = {}  # uid -> {"data": dict, "is_edit": bool, "proj": str|None}
+PLANNING: dict = {}       # uid -> [{"role": "user"/"assistant", "content": "..."}] محادثة تخطيط قبل البناء
 
 SITES_DIR = os.path.join(os.path.dirname(__file__), "sites")
 UPLOADS_DIR = os.path.join(SITES_DIR, "_uploads")
@@ -116,11 +117,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 دليل الاستخدام\n\n"
-        "🏗 بناء موقع جديد: أرسل وصفاً تفصيلياً.\n\n"
-        "✏️ تعديل: اضغط زر تعديل، ثم أرسل نص أو صورة (مع وصف أو بدونه).\n\n"
+        "🏗 بناء موقع جديد: احكِ لي عن فكرتك بشكل طبيعي، حتى لو على دفعات.\n"
+        "أنا أرد عليك وأسألك عن أي تفصيل ناقص، ولا أبدأ البناء إلا لما أحس إنك جاهز "
+        "(مثل ما تقول: يلا ابدأ / سويها / تمام جاهز).\n"
+        "كل ما تقوله يُلتزم به بالضبط — لا أخترع أقسام أو منتجات من عندي.\n\n"
+        "👀 بعد البناء تشوف معاينة فعلية قبل النشر النهائي، وتقدر تطلب تعديلات عليها قبل تأكيد النشر.\n\n"
+        "✏️ تعديل موقع منشور: اضغط زر تعديل، ثم أرسل نص أو صورة (مع وصف أو بدونه).\n\n"
         "📷 صورة بدون نص: نسألك وصف الاستخدام بعدها.\n"
         "📷 صورة مع نص: نطبّق التعديل فوراً.\n\n"
-        "/my — مشاريعك\n/stats — إحصائياتك\n/cancel — إلغاء التعديل"
+        "/my — مشاريعك\n/stats — إحصائياتك\n/cancel — إلغاء أي محادثة أو تعديل جارٍ"
     )
 
 
@@ -153,6 +158,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.message.from_user.id)
     PENDING_IMAGE.pop(uid, None)
     PENDING_BUILD.pop(uid, None)
+    PLANNING.pop(uid, None)
     if uid in EDIT_MODE:
         proj = EDIT_MODE.pop(uid)
         await update.message.reply_text(f"❌ تم إلغاء تعديل {proj}.")
@@ -179,6 +185,29 @@ async def _do_build(update: Update, uid: str, text: str):
         log(f"[BUILD_ERR] uid={uid} err={e}")
         await update.message.reply_text("⚠️ خطأ غير متوقع، جاري رفع صفحة مؤقتة.")
         return _fallback(text, uid)
+
+
+async def _do_build_from_conversation(update: Update, uid: str, conversation: list):
+    """يبني الموقع من كامل محادثة التخطيط — يضمن التزام AI بكل تفصيلة ذكرها المستخدم فقط."""
+    await _typing(update)
+    await update.message.reply_text("⚙️ تمام، جاري بناء موقعك بناءً على كل ما اتفقنا عليه 🧠")
+    user_msgs = " ".join(m["content"] for m in conversation if m["role"] == "user")
+    try:
+        log(f"[BUILD_CONV] uid={uid} turns={len(conversation)}")
+        data = safe_parse(build_from_conversation(conversation))
+        if not data:
+            raise ValueError("safe_parse=None")
+        _track(uid, "builds")
+        log(f"[BUILD_CONV_OK] uid={uid} proj={data.get('projectName')}")
+        return data
+    except RuntimeError as e:
+        log(f"[BUILD_CONV_FAIL] uid={uid} err={e}")
+        await update.message.reply_text("⚠️ المحرك مشغول الآن، جاري رفع صفحة مؤقتة.\nأعد الطلب بعد لحظة.")
+        return _fallback(user_msgs, uid)
+    except Exception as e:
+        log(f"[BUILD_CONV_ERR] uid={uid} err={e}")
+        await update.message.reply_text("⚠️ خطأ غير متوقع، جاري رفع صفحة مؤقتة.")
+        return _fallback(user_msgs, uid)
 
 
 async def _do_edit(update: Update, uid: str, text: str, proj: str,
@@ -356,16 +385,39 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data = await _do_edit(update, uid, text, proj, image_url=pending["url"], image_path=pending["path"])
             else:
                 data = await _do_edit(update, uid, text, proj)
-            is_edit = True
-        else:
-            proj = None
-            data = await _do_build(update, uid, text)
-            is_edit = False
+            if not data:
+                return
+            await _do_preview(update, uid, data, is_edit=True, original_proj=proj)
+            return
+
+        # ── محادثة تخطيط قبل البناء ──────────────
+        # نتراكم رسائل المستخدم بهذا السياق إلى أن يقرر AI نفسه إنه فهم وجاهز للبناء
+        history = PLANNING.setdefault(uid, [])
+        history.append({"role": "user", "content": text})
+
+        await _typing(update)
+        try:
+            reply_text, ready = plan_chat(history)
+        except RuntimeError as e:
+            log(f"[PLAN_CHAT_FAIL] uid={uid} err={e}")
+            await update.message.reply_text("⚠️ المحرك مشغول الآن، حاول إعادة كتابة طلبك بعد لحظة.")
+            return
+
+        history.append({"role": "assistant", "content": reply_text})
+
+        if not ready:
+            await update.message.reply_text(reply_text)
+            return
+
+        # المستخدم جاهز — نبني فعلياً من كامل المحادثة المتراكمة
+        await update.message.reply_text(reply_text)
+        data = await _do_build_from_conversation(update, uid, history)
+        PLANNING.pop(uid, None)
 
         if not data:
             return
 
-        await _do_preview(update, uid, data, is_edit=is_edit, original_proj=proj)
+        await _do_preview(update, uid, data, is_edit=False, original_proj=None)
 
     except Exception as e:
         log(f"[HANDLE_FATAL] uid={uid} err={e}")
