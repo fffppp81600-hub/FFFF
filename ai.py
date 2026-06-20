@@ -88,21 +88,34 @@ TECHNOLOGY RULES:
 - Tailwind v4 CDN in index.html: <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
 - index.html must link style.css and script.js properly.
 
-DEEP UNDERSTANDING — THINK LIKE A PRODUCT OWNER:
+SCOPE RULE — THE MOST IMPORTANT RULE, NEVER VIOLATE:
+Build EXACTLY what the user asked for — nothing more, nothing less.
+- If the user asked for a simple page (logo, title, background, animation), build ONLY that. Do NOT add
+  products, categories, a cart, prices, or any e-commerce elements unless the user explicitly asked for
+  a store/shop/products.
+- Do NOT assume a brand name implies a store. A name + logo + background request is a simple branded
+  page, not an e-commerce site, unless words like "متجر" (store) / "منتجات" (products) / "بيع" (sell) /
+  "اقسام" (categories) / "سلة" (cart) actually appear in the request.
+- The E-COMMERCE MANDATORY LOGIC section below applies ONLY when the user's request clearly describes
+  a store with products to sell. For every other request, ignore that section completely.
+
+DEEP UNDERSTANDING — THINK LIKE A PRODUCT OWNER (applies only within what was actually requested):
 - "Store/متجر" implies: working cart, category nav, product images, prices, checkout — even if unstated
 - "Game/لعبة" implies: score, win/lose, restart button
 - "Dashboard" implies: charts, stat cards, sidebar
 - Vague wording ("خله احلى") = visual polish only, never change structure
 - "غير اللون" without specifying = apply to primary brand color consistently
 - Never silently delete a feature the user didn't ask to remove
+- Never silently ADD a feature/section/category the user didn't ask for, even if it "feels natural"
 
 DESIGN: premium gradients, glassmorphism, animations, hover states, dark theme default, fully responsive.
 ARABIC: Arabic request = dir="rtl" lang="ar", Cairo/Tajawal font.
 
-CONTENT: Implement every feature mentioned or implied. Realistic content, real product names/prices.
+CONTENT: Implement every feature mentioned or implied. Realistic content, real product names/prices —
+but ONLY if a store was actually requested (see SCOPE RULE above).
 Stores: product photos from https://picsum.photos/seed/SEEDNAME/400/500 (unique seed each).
 
-E-COMMERCE MANDATORY LOGIC:
+E-COMMERCE MANDATORY LOGIC (ONLY IF a store/products/cart was explicitly requested — otherwise skip entirely):
 - ALL products in one JS array {id,name,category,price,image}
 - Category buttons filter the SAME array via one shared function — never separate disconnected sections
 - Real cart state (let cart=[]), add-to-cart updates visible badge count
@@ -114,20 +127,23 @@ REAL LINKS RULE: If real links are provided under "روابط حقيقية" in t
 never invent alternative URLs. For YouTube links, convert watch?v=ID to embed/ID inside an <iframe>.
 For other links, use plain <a href> tags with the provided titles.
 
-FORBIDDEN: placeholder text like "Product 1"/"Lorem ipsum", stub functions, broken category filters, fake payment claims."""
+FORBIDDEN: placeholder text like "Product 1"/"Lorem ipsum", stub functions, broken category filters,
+fake payment claims, AND adding any store/product/cart elements when none were requested."""
 
 
 BUILD_PROMPT = """Build a complete, production-ready website.
 
 REQUEST: {request}
 
-CRITICAL RULE: Only build what the user actually asked for. If they specified a product category
-(e.g. electronics), every product/section must belong to that category — never invent unrelated
-categories or products. Fill in realistic details (names, prices, images) WITHIN what was requested,
-never outside its scope.
+CRITICAL RULE: Only build EXACTLY what the user asked for — nothing more.
+- If the request does NOT explicitly mention a store/products/cart/categories, do NOT add any of them.
+  A request for a logo + name + background animation is a simple branded page, not a store.
+- If they DID specify a product category (e.g. electronics), every product/section must belong to
+  that category — never invent unrelated categories or products.
+- Fill in realistic details (names, prices, images) WITHIN what was requested, never outside its scope.
 
 Implement every feature fully. Premium design. Arabic = RTL + Cairo font.
-Stores need working filters, cart, and simulated checkout.
+Only add cart/filters/checkout if the request is actually a store.
 
 Return ONLY the JSON object."""
 
@@ -242,7 +258,13 @@ def _validate(data: dict) -> None:
 
 
 def _looks_like_store(text: str) -> bool:
-    keywords = ["متجر", "محل", "منتج", "سلة", "تسوق", "store", "shop", "cart", "product"]
+    """
+    يفحص كلمات دالة على متجر/منتجات بحدود كلمة كاملة لتجنّب إيجابيات خاطئة
+    (مثل "محلي" أو "تسوقها" تطابق جزئياً مع "محل"/"تسوق" لو كان الفحص بسيط).
+    استُبعدت "محل" من القائمة لأنها كثيرة الالتباس بالعربي (محلي، محلات، بمحل إقامتي...).
+    """
+    keywords = ["متجر", "منتجات", "منتج", "سلة التسوق", "سلة المشتريات", "بيع المنتجات",
+                "store", "shop", "cart", "products", "e-commerce", "ecommerce"]
     return any(k in text for k in keywords)
 
 
@@ -428,8 +450,9 @@ def build_from_conversation(conversation: list) -> str:
             links_block = web_search.format_links_for_prompt(results)
 
     prompt = BUILD_PROMPT.format(request=full_request) + (
-        "\n\nمهم جداً: التزم حرفياً بكل ما ورد أعلاه فقط. "
-        "لا تضف نوع منتجات أو فكرة أو قسم لم يُذكر صراحة في كلام المستخدم. "
+        "\n\nمهم جداً جداً: التزم حرفياً بكل ما ورد أعلاه فقط، بدون أي زيادة. "
+        "إذا لم يذكر المستخدم صراحة كلمة متجر/منتجات/سلة/أقسام، فهذا طلب صفحة بسيطة فقط "
+        "(مثل شعار + اسم + خلفية) — لا تضف أي منتجات أو أقسام أو سلة تسوق من عندك أبداً. "
         "إذا ذكر المستخدم نوع منتجات معيّن (مثل إلكترونيات)، يجب أن تكون كل المنتجات في هذا الموقع "
         "من هذا النوع فقط، ولا تخترع أقسام أو منتجات من نوع مختلف."
     ) + links_block
