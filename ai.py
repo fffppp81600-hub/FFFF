@@ -1,14 +1,12 @@
 """
 ai.py — Groq (Llama 3.3 70B) — محرك بناء وتعديل مواقع بفهم عميق للسياق.
 
-ميزات الفهم العميق:
+ميزات:
   - استنتاج الميزات الضمنية غير المذكورة صراحة (متجر = سلة + دفع حتى لو ما ذكرها المستخدم)
-  - تلخيص الكود الحالي تلقائياً قبل التعديل (orientation سريع لـ AI)
+  - تلخيص الكود الحالي تلقائياً قبل التعديل + ضغطه لتقليل استهلاك التوكنات
   - تصنيف نوع طلب التعديل (تصميم / إضافة ميزة / حذف / تصحيح خطأ / محتوى)
-  - فحوصات جودة تلقائية متعددة حسب نوع الموقع
-  - دعم إرفاق صورة من المستخدم (تيليجرام): استخدامها كلوقو، أو استخراج لونها السائد لتطبيقه
-    على ألوان الموقع، أو استخدامها كصورة منتج معيّن — الموديل نصي فقط فلا "يرى" الصورة،
-    لذلك نمرّر له رابط الصورة جاهزاً + اللون السائد المُستخرَج محلياً عبر Pillow.
+  - دعم صورة مرفقة من المستخدم: رابط مباشر + استخراج لونها السائد محلياً (Pillow)
+  - max_tokens وحجم prompt مضبوطين ليبقوا تحت حد Groq المجاني (12000 توكن/دقيقة)
 """
 import os
 import re
@@ -20,146 +18,158 @@ from groq import Groq
 
 load_dotenv()
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 MODEL = "llama-3.3-70b-versatile"
 
+# ─────────────────────────────────────────────
+# نظام تناوب المفاتيح (Key Rotation)
+# يدعم من مفتاح واحد إلى 10 مفاتيح. يضاف بـ .env كالتالي:
+#   GROQ_API_KEY=key1
+#   GROQ_API_KEY_2=key2
+#   GROQ_API_KEY_3=key3
+#   ... إلى GROQ_API_KEY_10
+# عند فشل مفتاح (حد التوكنات/الكوتة)، ينتقل تلقائياً للمفتاح التالي بدون أي تدخل،
+# والسياق (الكود الحالي للمشروع) محفوظ بقاعدة البيانات لا بالمفتاح، فلا حاجة لإعادة شرح الفكرة.
+# ─────────────────────────────────────────────
+_API_KEYS = []
+_first_key = os.getenv("GROQ_API_KEY")
+if _first_key:
+    _API_KEYS.append(_first_key)
+for _i in range(2, 11):
+    _k = os.getenv(f"GROQ_API_KEY_{_i}")
+    if _k:
+        _API_KEYS.append(_k)
 
-BASE_SYSTEM = """You are an elite Senior Frontend Engineer, Game Developer, and UI/UX Designer AI with 15 years of experience. You think deeply before coding: you infer the user's true intent, including features they implied but didn't explicitly state.
+if not _API_KEYS:
+    raise RuntimeError("لا يوجد أي GROQ_API_KEY في متغيرات البيئة!")
+
+_clients = [Groq(api_key=k) for k in _API_KEYS]
+_current_key_index = 0  # يبدأ من أول مفتاح، يتقدّم عند فشل المفتاح الحالي
+
+
+def _get_client():
+    return _clients[_current_key_index]
+
+
+def _rotate_key() -> bool:
+    """
+    يتقدّم للمفتاح التالي. يرجع True لو فيه مفتاح آخر لم نجربه بهذه الدورة، False لو رجعنا لأول مفتاح
+    (يعني جربنا كل المفاتيح المتاحة ولا واحد منها نجح).
+    """
+    global _current_key_index
+    _current_key_index = (_current_key_index + 1) % len(_clients)
+    return _current_key_index != 0
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    """يكتشف لو الخطأ بسبب حد التوكنات/الكوتة تحديداً (مو خطأ آخر غير مرتبط بالمفتاح)."""
+    msg = str(exc).lower()
+    return any(s in msg for s in ["429", "rate_limit", "quota", "tokens per minute", "request too large"])
+
+
+
+BASE_SYSTEM = """You are an elite Senior Frontend Engineer, Game Developer, and UI/UX Designer AI. You think deeply before coding: you infer the user's true intent, including features they implied but didn't explicitly state.
 
 OUTPUT CONTRACT — NEVER VIOLATE:
-Return ONLY a raw JSON object. No markdown. No backticks. No explanation. No text before or after.
+Return ONLY a raw JSON object. No markdown. No backticks. No explanation.
 First char = {   Last char = }
 
 JSON STRUCTURE:
-{
-  "projectName": "kebab-case-max-30-chars",
-  "files": [
-    {"path": "index.html", "content": "...FULL COMPLETE HTML..."},
-    {"path": "style.css",  "content": "...FULL COMPLETE CSS..."},
-    {"path": "script.js",  "content": "...FULL COMPLETE JS..."}
-  ]
-}
+{"projectName": "kebab-case-max-30-chars", "files": [{"path": "index.html", "content": "..."}, {"path": "style.css", "content": "..."}, {"path": "script.js", "content": "..."}]}
 
 TECHNOLOGY RULES:
-- Pure vanilla HTML5 + CSS3 + ES6 JS ONLY
-- NO React, NO Vue, NO npm, NO imports, NO require()
-- Tailwind v4 via CDN ALWAYS in index.html head:
-  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-- index.html MUST have:
-  <link rel="stylesheet" href="style.css">
-  <script src="script.js"></script> before </body>
+- Pure vanilla HTML5 + CSS3 + ES6 JS ONLY. NO React/Vue/npm/imports.
+- Tailwind v4 CDN in index.html: <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+- index.html must link style.css and script.js properly.
 
-DEEP UNDERSTANDING RULES — THINK LIKE A PRODUCT OWNER:
-- "Store/متجر" implies: working cart, category navigation, product images, prices, checkout flow — even if not all listed explicitly
-- "Game/لعبة" implies: score tracking, win/lose states, restart button, fair difficulty
-- "Dashboard/لوحة تحكم" implies: charts, summary stat cards, sidebar/nav, realistic numbers
-- Vague wording ("خله احلى" / "make it nicer") means: improve visual polish only (gradients, spacing, animations, typography), never change structure or remove features
-- "غير اللون" without specifying an element means: apply to the primary brand color (buttons, headers, accents) consistently across all files
-- Always reconcile new requests with everything already built — never silently delete a feature the user didn't ask to remove
+DEEP UNDERSTANDING — THINK LIKE A PRODUCT OWNER:
+- "Store/متجر" implies: working cart, category nav, product images, prices, checkout — even if unstated
+- "Game/لعبة" implies: score, win/lose, restart button
+- "Dashboard" implies: charts, stat cards, sidebar
+- Vague wording ("خله احلى") = visual polish only, never change structure
+- "غير اللون" without specifying = apply to primary brand color consistently
+- Never silently delete a feature the user didn't ask to remove
 
-DESIGN REQUIREMENTS — MANDATORY:
-- STUNNING, PREMIUM, PRODUCTION-READY interfaces
-- Multi-stop mesh gradients, glassmorphism (backdrop-blur-xl), neon glow effects
-- Smooth CSS animations and transitions on everything
-- Hover/active/focus states on all interactive elements
-- Professional typography with Google Fonts, fully responsive (mobile-first)
-- Dark theme by default unless user specifies otherwise
-- NO plain/boring/basic designs
+DESIGN: premium gradients, glassmorphism, animations, hover states, dark theme default, fully responsive.
+ARABIC: Arabic request = dir="rtl" lang="ar", Cairo/Tajawal font.
 
-ARABIC LANGUAGE RULE:
-- Arabic request or Arabic audience: <html lang="ar" dir="rtl">, Google Font Cairo/Tajawal, full RTL layout
+CONTENT: Implement every feature mentioned or implied. Realistic content, real product names/prices.
+Stores: product photos from https://picsum.photos/seed/SEEDNAME/400/500 (unique seed each).
 
-CONTENT & FEATURES RULES — CRITICAL:
-- Implement EVERY feature mentioned OR implied — nothing skipped, nothing stubbed
-- Realistic content (real product names, real prices, real descriptions)
-- Stores: product photos from https://picsum.photos/seed/SEEDNAME/400/500 (unique seed per product)
-- Games: 100% working gameplay, scoring, win/lose conditions
-- Dashboards: real Chart.js charts from CDN, realistic data
-- Minimum 200 lines HTML, 100 lines CSS, 250+ lines JS for stores/apps
+E-COMMERCE MANDATORY LOGIC:
+- ALL products in one JS array {id,name,category,price,image}
+- Category buttons filter the SAME array via one shared function — never separate disconnected sections
+- Real cart state (let cart=[]), add-to-cart updates visible badge count
+- Cart icon top-left opens panel with items/remove/subtotal/checkout button
+- Checkout: address input, order summary, Apple Pay styled button (visual simulation only, never real payment)
+- Every step must work with zero dead buttons
 
-E-COMMERCE — MANDATORY WORKING LOGIC (most common failure point, be extremely careful):
-- ALL products in one JS array of objects: {id, name, category, price, image}
-- Every category button calls ONE shared filter function over the SAME array and re-renders — never separate disconnected HTML sections per category
-- Real cart state (`let cart = []`): Add-to-cart pushes + calls updateCartUI() + updateCartCount()
-- Cart icon fixed top-left (Salla-style) with live badge count; click opens panel with items, qty, remove, subtotal, and "إتمام الشراء" button
-- Checkout: address input ("موقعك"), order summary, payment options including black rounded "Apple Pay" button (visual simulation only: sliding sheet, spinner, success check — never claim real payment)
-- Every step (browse → filter → cart → checkout → pay → confirm) must work with zero dead buttons
-
-FORBIDDEN:
-- Placeholder content like "Product 1", "Lorem ipsum", "TODO"
-- Basic unstyled pages, missing implied features, stub functions
-- Category buttons that don't filter correctly
-- Add-to-cart buttons with no visible state change
-- Claiming real payment processing happens"""
+FORBIDDEN: placeholder text like "Product 1"/"Lorem ipsum", stub functions, broken category filters, fake payment claims."""
 
 
-BUILD_PROMPT = """Build a complete, stunning, production-ready website for this request.
+BUILD_PROMPT = """Build a complete, production-ready website.
 
-USER REQUEST: {request}
+REQUEST: {request}
 
-Before coding, think about what this type of site implicitly needs beyond what's literally written, and include it.
-
-REQUIREMENTS:
-1. Implement EVERY feature mentioned or reasonably implied, with full working logic
-2. Realistic content — real product names, descriptions, prices if it's a store
-3. PREMIUM and PROFESSIONAL look — not a basic template
-4. Arabic request = RTL + Cairo font + Arabic content throughout
-5. Stores: category filters must filter live, cart must track items visibly, checkout must work with simulated Apple Pay
-6. Minimum: 200 lines HTML, 100 lines CSS, 250+ lines JS for stores
+Think about implicit needs beyond what's literally written and include them.
+Implement every feature fully. Premium design. Arabic = RTL + Cairo font.
+Stores need working filters, cart, and simulated checkout.
 
 Return ONLY the JSON object."""
 
 
-EDIT_PROMPT = """You are modifying an existing live website. Understand the current code deeply before changing anything.
+EDIT_PROMPT = """Modify this existing website. Understand it before changing anything.
 
-CODE SUMMARY (quick orientation): {code_summary}
+SUMMARY: {code_summary}
 
-CURRENT FULL CODE:
+CURRENT CODE:
 {current_code}
 
-USER'S EDIT REQUEST: {edit_request}
+EDIT REQUEST: {edit_request}
 
-INSTRUCTIONS:
-1. Identify the change type: (a) visual/style only, (b) new feature, (c) removal, (d) bug fix, (e) content change
-2. If vague ("خله احلى", "زيد شي", "غيره"), infer the most sensible interpretation from what the site currently does — improve without breaking structure
-3. Apply the change completely across ALL files that need it (a color change may need both CSS and inline Tailwind classes updated)
-4. NEVER remove or break an existing working feature unless explicitly asked
-5. Return ALL 3 files complete, even unchanged ones
+Apply the change completely across all files that need it. Never remove a working feature unless asked.
+Return ALL 3 files complete, even unchanged ones. Return ONLY the JSON object."""
 
-Return ONLY the JSON object."""
+
+# ─────────────────────────────────────────────
+# Code compression — critical for staying under Groq free-tier TPM limit
+# ─────────────────────────────────────────────
+def compress_code_for_prompt(current_code: str, max_chars: int = 7000) -> str:
+    """
+    يضغط الكود الحالي قبل إرساله لتقليل استهلاك التوكنات (حد Groq المجاني: 12000 توكن/دقيقة).
+    يحذف المسافات الزائدة بدون كسر بنية الكود، ويقتطع الزيادة مع تنبيه واضح للنموذج.
+    """
+    if not current_code:
+        return current_code
+    compressed = re.sub(r"[ \t]{2,}", " ", current_code)
+    compressed = re.sub(r"\n{3,}", "\n\n", compressed)
+    if len(compressed) <= max_chars:
+        return compressed
+    return compressed[:max_chars] + "\n\n[...الباقي مقتطع لتجاوز الحد. حافظ على ما لم يظهر كاملاً كما هو.]"
 
 
 def summarize_code(current_code: str) -> str:
-    """تلخيص سريع للكود الحالي بدون استدعاء AI إضافي — orientation للنموذج."""
+    """تلخيص سريع للكود الحالي بدون استدعاء AI إضافي."""
     if not current_code or len(current_code.strip()) < 20:
         return "لا يوجد كود سابق — مشروع جديد بالكامل."
-
     lower = current_code.lower()
     features = []
     checks = [
-        (["cart", "سلة"], "نظام سلة تسوق"),
-        (["category", "قسم", "filter"], "فلترة/أقسام منتجات"),
-        (["apple pay", "checkout", "دفع"], "صفحة دفع/checkout"),
-        (["score", "game"], "منطق لعبة (نقاط/فوز/خسارة)"),
-        (["chart", "canvas"], "رسوم بيانية / dashboard"),
-        (["cairo", 'dir="rtl"'], "موقع عربي بتخطيط RTL"),
-        (["picsum", "placeholder.com"], "صور منتجات placeholder"),
+        (["cart", "سلة"], "سلة تسوق"),
+        (["category", "قسم", "filter"], "فلترة/أقسام"),
+        (["apple pay", "checkout", "دفع"], "صفحة دفع"),
+        (["score", "game"], "منطق لعبة"),
+        (["chart", "canvas"], "رسوم بيانية"),
+        (["cairo", 'dir="rtl"'], "موقع عربي RTL"),
     ]
     for keywords, label in checks:
         if any(k in lower for k in keywords):
             features.append(label)
-
-    files_found = re.findall(r"--- (\S+) ---", current_code)
-    files_note = f"الملفات الموجودة: {', '.join(set(files_found))}" if files_found else ""
-
-    if features:
-        return f"{files_note}\nالميزات المكتشفة حالياً: {', '.join(features)}."
-    return f"{files_note}\nموقع بسيط بدون ميزات تفاعلية معقدة مكتشفة."
+    return f"الميزات الحالية: {', '.join(features)}." if features else "موقع بسيط."
 
 
 def classify_edit_intent(edit_request: str) -> str:
-    """تصنيف سريع لنوع طلب التعديل — يساعد القرار لو الطلب غامض."""
-    vague_markers = ["احلى", "افضل", "حسن", "طور", "زيد شي", "ضيف شي", "غيره شوي"]
+    """تصنيف سريع لنوع طلب التعديل."""
+    vague_markers = ["احلى", "افضل", "حسن", "طور", "زيد شي", "ضيف شي"]
     if any(m in edit_request for m in vague_markers) and len(edit_request.split()) < 5:
         return "vague_polish"
     if any(w in edit_request for w in ["حذف", "شيل", "ازل", "remove", "delete"]):
@@ -172,16 +182,10 @@ def classify_edit_intent(edit_request: str) -> str:
 
 
 def extract_dominant_color(image_path: str) -> Optional[str]:
-    """
-    يستخرج اللون السائد من صورة محلية (مسار ملف على القرص) كـ hex code.
-    الموديل (llama-3.3-70b) نصي بالكامل ولا يستطيع "رؤية" الصورة، لذلك أي طلب من نوع
-    "خلي لون الصفحة نفس لون الصورة" يحتاج هذا الاستخراج يصير بكود قبل إرسال الطلب للـ AI.
-    يرجع None لو فشل الاستخراج (مثلاً مكتبة Pillow غير مثبتة أو مسار خاطئ) بدون رفع استثناء.
-    """
+    """يستخرج اللون السائد من صورة محلية (hex code) — الموديل نصي ولا يرى الصورة فعلياً."""
     try:
         from PIL import Image
-        img = Image.open(image_path).convert("RGB")
-        img = img.resize((50, 50))
+        img = Image.open(image_path).convert("RGB").resize((50, 50))
         pixels = list(img.getdata())
         n = len(pixels)
         r = sum(p[0] for p in pixels) // n
@@ -193,29 +197,17 @@ def extract_dominant_color(image_path: str) -> Optional[str]:
 
 
 def _build_image_instruction(image_url: Optional[str], image_path: Optional[str]) -> str:
-    """يبني بلوك تعليمات واضح للـ AI عن الصورة المرفقة (رابط + لون سائد إن وُجد)."""
+    """تعليمات مختصرة للـ AI عن الصورة المرفقة — مضغوطة لتقليل التوكنات."""
     if not image_url:
         return ""
-
     dominant = extract_dominant_color(image_path) if image_path else None
-
-    block = (
-        "\n\n[صورة مرفقة من المستخدم — استخدم هذه المعطيات حرفياً، لا تخترع رابط بديل]\n"
-        f"رابط الصورة المباشر (استخدمه كما هو، بدون تغيير): {image_url}\n"
-    )
+    block = f"\n\n[صورة مرفقة: {image_url}]"
     if dominant:
-        block += f"اللون السائد المستخرج من الصورة بدقة (hex جاهز، لا تخمّن لوناً آخر): {dominant}\n"
-
+        block += f" [لون سائد: {dominant}]"
     block += (
-        "تعليمات تطبيق الصورة حسب نوع الطلب:\n"
-        "- إذا طلب المستخدم استخدام الصورة كلوقو/شعار: استخدم الرابط أعلاه كـ src لعنصر "
-        "اللوقو في index.html، واحذف أي شعار نصي أو placeholder قديم محله.\n"
-        "- إذا طلب أن يكون لون الصفحة نفس لون الصورة: طبّق اللون السائد أعلاه (hex) على الألوان "
-        "الأساسية في التصميم (الهيدر، الأزرار الأساسية، الـ accents) داخل style.css، وحدّث أي "
-        "Tailwind classes ملوّنة مرتبطة بنفس العنصر بحيث تنسجم مع هذا اللون.\n"
-        "- إذا طلب أن تكون هذه الصورة صورة منتج معيّن: غيّر فقط حقل image لذلك المنتج تحديداً في "
-        "مصفوفة المنتجات داخل script.js إلى الرابط أعلاه، دون لمس باقي بيانات المنتج أو المنتجات الأخرى.\n"
-        "- لا تستبدل أي صورة أخرى في الموقع بهذا الرابط إلا العنصر المطلوب صراحة.\n"
+        " لوقو=استخدم الرابط كـ src للوقو في index.html. "
+        "لون الصفحة=طبّق اللون السائد على العناصر الأساسية بـ style.css. "
+        "صورة منتج معيّن=غيّر فقط image لذلك المنتج بمصفوفة script.js."
     )
     return block
 
@@ -293,16 +285,16 @@ def _call(prompt: str, retries: int = 5, check_store: bool = False) -> str:
 
     for i in range(1, retries + 1):
         try:
+            client = _get_client()
             resp = client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=16000,
+                max_tokens=7000,
                 response_format={"type": "json_object"},
             )
             last_raw = resp.choices[0].message.content.strip()
             extracted = _extract_json(last_raw)
-
             try:
                 data = json.loads(extracted)
             except json.JSONDecodeError:
@@ -314,7 +306,7 @@ def _call(prompt: str, retries: int = 5, check_store: bool = False) -> str:
             if check_store:
                 js_content = next((f["content"] for f in data["files"] if f["path"] == "script.js"), "")
                 if not _has_cart_logic(js_content):
-                    raise ValueError("متجر بدون منطق سلة حقيقي في script.js — إعادة المحاولة")
+                    raise ValueError("متجر بدون منطق سلة حقيقي — إعادة المحاولة")
 
             return extracted
 
@@ -324,18 +316,18 @@ def _call(prompt: str, retries: int = 5, check_store: bool = False) -> str:
             last_err = f"Validation error attempt {i}: {e}"
         except Exception as e:
             last_err = f"API error attempt {i}: {e}"
+            err_text = str(e).lower()
+            if ("429" in err_text or "rate_limit" in err_text or "tokens per minute" in err_text) and len(_clients) > 1:
+                _rotate_key()
 
         if i < retries:
-            time.sleep(2 * i)
+            time.sleep(3 * i)
 
-    raise RuntimeError(f"Groq failed {retries}x. Last: {last_err} | raw[:300]={(last_raw or '')[:300]}")
+    raise RuntimeError(f"Groq failed {retries}x across {len(_clients)} key(s). Last: {last_err} | raw[:300]={(last_raw or '')[:300]}")
 
 
 def builder(request: str) -> str:
-    return _call(
-        BUILD_PROMPT.format(request=request),
-        check_store=_looks_like_store(request),
-    )
+    return _call(BUILD_PROMPT.format(request=request), check_store=_looks_like_store(request))
 
 
 def editor(
@@ -344,28 +336,23 @@ def editor(
     image_url: Optional[str] = None,
     image_path: Optional[str] = None,
 ) -> str:
-    """
-    image_url: رابط عام (دائم وقابل للتحميل) للصورة التي أرسلها المستخدم بالتيليجرام —
-               يجب رفعها لاستضافة عامة قبل تمريرها هنا (رابط تيليجرام المباشر مؤقت ومربوط بالتوكن).
-    image_path: مسار محلي للصورة على القرص (نفس الصورة) يُستخدم فقط لاستخراج اللون السائد محلياً.
-    """
     summary = summarize_code(current_code)
     intent = classify_edit_intent(edit_request)
+    compressed_code = compress_code_for_prompt(current_code)
 
     intent_hints = {
-        "vague_polish": "النية المكتشفة: طلب تحسين بصري عام فقط. لا تغيّر البنية أو تحذف ميزات — فقط حسّن المظهر.",
-        "removal": "النية المكتشفة: طلب حذف/إزالة شيء معين. تأكد من حذفه بدقة دون التأثير على باقي الميزات.",
-        "style_only": "النية المكتشفة: تعديل تصميم/ألوان/خطوط. لا تغيّر المنطق الوظيفي.",
-        "bug_fix": "النية المكتشفة: تصحيح خطأ أو مشكلة. ركّز على إيجاد سبب العطل في الكود الحالي وإصلاحه دون كسر أي شيء آخر يعمل.",
-        "feature_or_content": "النية المكتشفة: إضافة ميزة جديدة أو محتوى. أضفها بالتكامل الكامل مع الكود الموجود.",
+        "vague_polish": "[نية: تحسين بصري فقط، لا تغيّر البنية]",
+        "removal": "[نية: حذف دقيق دون التأثير على باقي الميزات]",
+        "style_only": "[نية: تصميم/ألوان فقط، لا تغيّر المنطق]",
+        "bug_fix": "[نية: تصحيح خطأ دون كسر شيء يعمل]",
+        "feature_or_content": "[نية: إضافة ميزة/محتوى متكامل]",
     }
-
     image_instruction = _build_image_instruction(image_url, image_path)
-    enriched_request = f"{edit_request}\n\n[{intent_hints.get(intent, '')}]{image_instruction}"
+    enriched_request = f"{edit_request} {intent_hints.get(intent, '')}{image_instruction}"
 
     return _call(
         EDIT_PROMPT.format(
-            current_code=current_code or "(no source — treat as new project)",
+            current_code=compressed_code or "(no source — new project)",
             code_summary=summary,
             edit_request=enriched_request,
         ),
