@@ -84,3 +84,4 @@ def get_user_projects_size(user_id: str) -> int:
 def project_files_exist(user_id: str, project_name: str) -> bool:
     """فحص سريع بدون قراءة محتوى أي ملف — يفيد لو احتجنا فقط نعرف هل المشروع موجود محلياً."""
     return os.path.isdir(_project_dir(user_id, project_name))
+  
