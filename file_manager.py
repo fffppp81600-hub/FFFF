@@ -1,135 +1,86 @@
 """
-file_manager.py — إدارة ملفات المشاريع على القرص المحلي.
-يتعامل مع: /projects/<user_id>/<project_name>/ (مساحة عمل Claude/AI المحلية قبل النشر)
+file_manager.py — إدارة ملفات المشاريع على القرص (طبقة فوق مجلدات projects/<uid>/<name>/).
 
 ميزات:
-  - قراءة/حذف ملفات مشروع
-  - فحص سلامة المشروع (الملفات الأساسية موجودة وغير فاضية)
-  - حساب حجم المشروع
-  - نسخ احتياطي تلقائي قبل أي حذف (للأمان)
+  - قراءة/حذف ملفات مشروع معيّن لمستخدم معيّن
+  - حماية من path traversal (لا يسمح بمسارات تخرج عن مجلد المشروع)
+  - عدّ حجم مشاريع المستخدم (يفيد مستقبلاً لحدود استخدام لكل مستخدم)
+  - حذف نظيف مع تسجيل الأخطاء بدل تمريرها بصمت
 """
 import os
-import shutil
-from datetime import datetime
-from logger import log, log_warn, log_error
+from logger import log
 
-PROJECTS_DIR = os.path.join(os.path.dirname(__file__), "projects")
-BACKUP_DIR   = os.path.join(os.path.dirname(__file__), "_backups")
-os.makedirs(PROJECTS_DIR, exist_ok=True)
-os.makedirs(BACKUP_DIR, exist_ok=True)
-
-REQUIRED_FILES = {"index.html", "style.css", "script.js"}
+BASE_DIR = os.path.join(os.path.dirname(__file__), "projects")
+os.makedirs(BASE_DIR, exist_ok=True)
 
 
-def _project_path(user_id: str, project_name: str) -> str:
-    return os.path.join(PROJECTS_DIR, str(user_id), project_name)
+def _project_dir(user_id: str, project_name: str) -> str:
+    return os.path.join(BASE_DIR, str(user_id), project_name)
+
+
+def _is_safe_path(base: str, target: str) -> bool:
+    """يمنع أي مسار يحاول الخروج عن مجلد المشروع (حماية أساسية ضرورية)."""
+    base = os.path.abspath(base)
+    target = os.path.abspath(target)
+    return target == base or target.startswith(base + os.sep)
 
 
 def get_project_files(user_id: str, project_name: str) -> list:
-    """
-    يرجّع كل ملفات المشروع كقائمة [{"path": ..., "content": ...}, ...]
-    يتجاهل مجلد uploads (الصور) — تلك لها معالجة خاصة في deploy.py
-    """
-    base = _project_path(user_id, project_name)
-    if not os.path.exists(base):
+    """يرجّع كل ملفات المشروع كقائمة {"path": ..., "content": ...} أو [] لو غير موجود."""
+    project_dir = _project_dir(user_id, project_name)
+    if not os.path.isdir(project_dir):
         return []
 
     files = []
-    for root, dirs, filenames in os.walk(base):
-        if "uploads" in root.split(os.sep):
-            continue
-        for filename in filenames:
-            full_path = os.path.join(root, filename)
-            rel_path = os.path.relpath(full_path, base).replace("\\", "/")
+    for root, _dirs, filenames in os.walk(project_dir):
+        for fname in filenames:
+            full_path = os.path.join(root, fname)
+            if not _is_safe_path(project_dir, full_path):
+                continue  # تجاهل أي مسار مشبوه بدل رفع استثناء يكسر التدفق
+            rel_path = os.path.relpath(full_path, project_dir)
             try:
                 with open(full_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                files.append({"path": rel_path, "content": content})
-            except UnicodeDecodeError:
-                # ملف ثنائي (صورة مثلاً) — تجاهله بصمت، له معالجة مختلفة
-                continue
-            except Exception as e:
-                log_warn(f"[FILE_READ_ERR] {full_path} err={e}")
+                files.append({"path": rel_path.replace(os.sep, "/"), "content": content})
+            except (UnicodeDecodeError, OSError) as e:
+                # ملفات ثنائية (صور uploads مثلاً) — نتجاهلها هنا، الكود النصي فقط مطلوب
+                log(f"[FILE_MANAGER_SKIP] user={user_id} proj={project_name} file={rel_path} err={e}")
     return files
 
 
-def get_project_path(user_id: str, project_name: str) -> str:
-    """يرجّع المسار الكامل للمشروع — مفيد لو احتجت وصول مباشر."""
-    return _project_path(user_id, project_name)
+def delete_project_files(user_id: str, project_name: str) -> bool:
+    """يحذف مجلد المشروع بالكامل من القرص. يرجع True لو نجح الحذف أو لم يكن المشروع موجوداً أصلاً."""
+    project_dir = _project_dir(user_id, project_name)
+    if not os.path.isdir(project_dir):
+        return True
+
+    try:
+        import shutil
+        shutil.rmtree(project_dir)
+        log(f"[FILE_MANAGER_DELETE_OK] user={user_id} proj={project_name}")
+        return True
+    except Exception as e:
+        log(f"[FILE_MANAGER_DELETE_ERR] user={user_id} proj={project_name} err={e}")
+        return False
 
 
-def project_integrity_ok(user_id: str, project_name: str) -> tuple:
-    """
-    يفحص أن المشروع سليم: الملفات الأساسية موجودة وغير فاضية.
-    يرجّع (ok: bool, missing_or_empty: list)
-    """
-    files = get_project_files(user_id, project_name)
-    paths_with_content = {f["path"]: f["content"] for f in files}
-
-    problems = []
-    for required in REQUIRED_FILES:
-        content = paths_with_content.get(required, "")
-        if not content.strip():
-            problems.append(required)
-
-    return (len(problems) == 0, problems)
-
-
-def get_project_size(user_id: str, project_name: str) -> int:
-    """يحسب حجم المشروع بالبايت (يشمل الصور)."""
-    base = _project_path(user_id, project_name)
-    if not os.path.exists(base):
+def get_user_projects_size(user_id: str) -> int:
+    """يحسب الحجم الكلي (بايت) لكل مشاريع مستخدم معيّن — يفيد لحدود استخدام مستقبلية."""
+    user_dir = os.path.join(BASE_DIR, str(user_id))
+    if not os.path.isdir(user_dir):
         return 0
+
     total = 0
-    for root, _, filenames in os.walk(base):
-        for filename in filenames:
+    for root, _dirs, filenames in os.walk(user_dir):
+        for fname in filenames:
+            full_path = os.path.join(root, fname)
             try:
-                total += os.path.getsize(os.path.join(root, filename))
+                total += os.path.getsize(full_path)
             except OSError:
                 pass
     return total
 
 
-def backup_project(user_id: str, project_name: str) -> str | None:
-    """
-    ينسخ المشروع احتياطياً قبل الحذف أو التعديل الخطير.
-    يحتفظ بآخر نسخة فقط لكل مشروع (لتوفير المساحة).
-    """
-    src = _project_path(user_id, project_name)
-    if not os.path.exists(src):
-        return None
-
-    dest = os.path.join(BACKUP_DIR, str(user_id), project_name)
-    try:
-        if os.path.exists(dest):
-            shutil.rmtree(dest)
-        shutil.copytree(src, dest)
-        log(f"[BACKUP_OK] user={user_id} project={project_name}")
-        return dest
-    except Exception as e:
-        log_error(f"[BACKUP_FAIL] user={user_id} project={project_name} err={e}")
-        return None
-
-
-def delete_project_files(user_id: str, project_name: str):
-    """يحذف ملفات المشروع المحلية مع نسخة احتياطية أولاً (أمان إضافي)."""
-    base = _project_path(user_id, project_name)
-    if not os.path.exists(base):
-        log_warn(f"[DELETE_SKIP] لا يوجد مشروع محلي: user={user_id} project={project_name}")
-        return
-
-    backup_project(user_id, project_name)
-
-    try:
-        shutil.rmtree(base)
-        log(f"[DELETE_OK] user={user_id} project={project_name}")
-    except Exception as e:
-        log_error(f"[DELETE_ERR] user={user_id} project={project_name} err={e}")
-
-
-def list_user_projects(user_id: str) -> list:
-    """يرجّع أسماء كل المشاريع المحلية لمستخدم معين (مفيد للتشخيص)."""
-    base = os.path.join(PROJECTS_DIR, str(user_id))
-    if not os.path.exists(base):
-        return []
-    return [d for d in os.listdir(base) if os.path.isdir(os.path.join(base, d))]
+def project_files_exist(user_id: str, project_name: str) -> bool:
+    """فحص سريع بدون قراءة محتوى أي ملف — يفيد لو احتجنا فقط نعرف هل المشروع موجود محلياً."""
+    return os.path.isdir(_project_dir(user_id, project_name))
