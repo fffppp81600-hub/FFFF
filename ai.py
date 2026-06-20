@@ -21,6 +21,7 @@ import time
 from typing import Optional
 from dotenv import load_dotenv
 from groq import Groq
+import web_search
 
 load_dotenv()
 
@@ -108,6 +109,10 @@ E-COMMERCE MANDATORY LOGIC:
 - Cart icon top-left opens panel with items/remove/subtotal/checkout button
 - Checkout: address input, order summary, Apple Pay styled button (visual simulation only, never real payment)
 - Every step must work with zero dead buttons
+
+REAL LINKS RULE: If real links are provided under "روابط حقيقية" in the request, use them EXACTLY as given —
+never invent alternative URLs. For YouTube links, convert watch?v=ID to embed/ID inside an <iframe>.
+For other links, use plain <a href> tags with the provided titles.
 
 FORBIDDEN: placeholder text like "Product 1"/"Lorem ipsum", stub functions, broken category filters, fake payment claims."""
 
@@ -381,21 +386,47 @@ def plan_chat(conversation: list) -> tuple[str, bool]:
     raise RuntimeError(f"Groq planning chat failed: {last_err}")
 
 
+def needs_real_links(conversation_text: str) -> Optional[str]:
+    """
+    يكتشف لو المستخدم يطلب محتوى يحتاج روابط حقيقية فعلية (فيديوهات، مواقع، مراجع)
+    ويرجع استعلام بحث مناسب، أو None لو الطلب لا يحتاج بحثاً حقيقياً.
+    اكتشاف بسيط بالكلمات المفتاحية — كافٍ هنا لأن التكلفة (استدعاء بحث خاطئ) منخفضة.
+    """
+    triggers = [
+        "فيديو", "فيديوهات", "يوتيوب", "youtube", "رابط حقيقي", "روابط حقيقية",
+        "منافس", "منافسين", "مواقع تشبه", "أمثلة حقيقية", "حط لي روابط",
+        "اعطني روابط", "اعطيني روابط", "افضل", "best", "top",
+    ]
+    if any(t in conversation_text for t in triggers):
+        return conversation_text[-200:]  # آخر جزء من المحادثة كاستعلام تقريبي
+    return None
+
+
 def build_from_conversation(conversation: list) -> str:
     """
     يبني الموقع من كامل محادثة التخطيط (مو من رسالة واحدة) — يضمن عدم اختراع تفاصيل
     لم يذكرها المستخدم عبر كل المحادثة، ويستخدم كل ما قاله حرفياً كمتطلبات.
+    لو الطلب يحتاج روابط حقيقية (فيديوهات/مواقع)، يبحث عنها فعلياً قبل البناء ويحقنها بالـ prompt.
     """
     full_request = "\n".join(
         f"{'المستخدم' if m['role'] == 'user' else 'البوت'}: {m['content']}"
         for m in conversation
     )
+
+    links_block = ""
+    if web_search.is_search_available():
+        search_query = needs_real_links(full_request)
+        if search_query:
+            results = web_search.search_real_links(search_query, max_results=5)
+            links_block = web_search.format_links_for_prompt(results)
+
     prompt = BUILD_PROMPT.format(request=full_request) + (
         "\n\nمهم جداً: التزم حرفياً بكل ما ورد في المحادثة أعلاه فقط. "
         "لا تضف نوع منتجات أو فكرة أو قسم لم يُذكر صراحة في كلام المستخدم. "
         "إذا ذكر المستخدم نوع منتجات معيّن (مثل إلكترونيات)، يجب أن تكون كل المنتجات في هذا الموقع "
         "من هذا النوع فقط، ولا تخترع أقسام أو منتجات من نوع مختلف."
-    )
+    ) + links_block
+
     full_text = "\n".join(m["content"] for m in conversation)
     return _call(prompt, check_store=_looks_like_store(full_text))
 
