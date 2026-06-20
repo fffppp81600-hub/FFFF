@@ -1,6 +1,6 @@
 """
 store.py — قاعدة بيانات SQLite دائمة.
-تخزن: المشاريع + ملفاتها بشكل دائم 100% (تنجو من إعادة تشغيل Render).
+تخزن: المشاريع وملفاتها + الصور المرفوعة (base64) بشكل دائم 100%.
 """
 import os
 import sqlite3
@@ -31,6 +31,16 @@ def init_db():
                 files TEXT NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (user_id, name)
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS images (
+                project_name TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                b64_data TEXT NOT NULL,
+                mime TEXT DEFAULT 'image/jpeg',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (project_name, filename)
             )
         """)
 
@@ -67,6 +77,7 @@ def get_project_files_db(user_id: str, name: str) -> list:
 def delete_project(user_id: str, name: str):
     with _conn() as c:
         c.execute("DELETE FROM projects WHERE user_id = ? AND name = ?", (str(user_id), name))
+        c.execute("DELETE FROM images WHERE project_name = ?", (name,))
 
 
 def get_all_projects() -> list:
@@ -86,4 +97,28 @@ def project_exists(user_id: str, name: str) -> bool:
             (str(user_id), name)
         ).fetchone()
         return row is not None
-        
+
+
+# ── Images (دائمة 100% — base64 بقاعدة البيانات) ──────────
+def save_image(project_name: str, filename: str, b64_data: str, mime: str = "image/jpeg"):
+    with _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO images (project_name, filename, b64_data, mime) VALUES (?, ?, ?, ?)",
+            (project_name, filename, b64_data, mime)
+        )
+
+
+def get_image(project_name: str, filename: str):
+    with _conn() as c:
+        row = c.execute(
+            "SELECT b64_data, mime FROM images WHERE project_name = ? AND filename = ?",
+            (project_name, filename)
+        ).fetchone()
+        return (row["b64_data"], row["mime"]) if row else None
+
+
+def get_all_images() -> list:
+    """يستخدمه server.py لاسترجاع كل الصور المرفوعة على القرص بعد كل إعادة تشغيل."""
+    with _conn() as c:
+        rows = c.execute("SELECT project_name, filename, b64_data, mime FROM images").fetchall()
+        return [dict(r) for r in rows]
