@@ -32,6 +32,7 @@ USER_STATS: dict = {}
 PENDING_IMAGE: dict = {}
 PENDING_BUILD: dict = {}  # uid -> {"data": dict, "is_edit": bool, "proj": str|None}
 PLANNING: dict = {}       # uid -> [{"role": "user"/"assistant", "content": "..."}] محادثة تخطيط قبل البناء
+LAST_VERSION: dict = {}   # proj_name -> {"files": [...], "url": str} — نسخة سابقة واحدة لكل مشروع (للرجوع/undo)
 
 SITES_DIR = os.path.join(os.path.dirname(__file__), "sites")
 UPLOADS_DIR = os.path.join(SITES_DIR, "_uploads")
@@ -108,9 +109,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 أهلاً {name}!\n\n"
         "أنا بوت بناء المواقع بالذكاء الاصطناعي 🤖\n\n"
-        "📌 أرسل وصف ما تريد وسأبنيه وأنشره فوراً 🚀\n"
-        "📷 وقت التعديل تقدر ترسل صور (لوقو/منتجات) لدمجها بالموقع.\n\n"
-        "/help — شرح مفصل\n/my — مشاريعك\n/stats — إحصائياتك\n/cancel — إلغاء التعديل"
+        "📌 احكِ لي عن فكرتك بشكل طبيعي، وأنا أرد وأسأل عن أي تفصيل ناقص.\n"
+        "✅ لما تكون جاهز (تقول مثلاً: يلا ابدأ)، أبني الموقع فعلياً وأعرض لك معاينة حقيقية قبل النشر.\n"
+        "🔎 لو طلبت روابط حقيقية (فيديوهات، مواقع)، أبحث فعلياً بالإنترنت وأضمّنها بالموقع.\n"
+        "📷 تقدر ترسل صورة (لوقو/منتج) مع وصفها في أي وقت.\n\n"
+        "/help — شرح مفصل\n/my — مشاريعك\n/stats — إحصائياتك\n/cancel — إلغاء أي محادثة جارية"
     )
 
 
@@ -220,6 +223,8 @@ async def _do_edit(update: Update, uid: str, text: str, proj: str,
     if local:
         for f in local:
             current += f"\n--- {f['path']} ---\n{f['content']}\n"
+        # نحفظ نسخة الموقع الحالية قبل التعديل — تُستخدم بزر "↩️ رجوع" لو ما عجب التعديل الجديد
+        LAST_VERSION[proj] = {"files": local}
     else:
         await update.message.reply_text("⚠️ لم أجد الملفات، سيُعامَل كمشروع جديد.")
 
@@ -263,14 +268,20 @@ async def _do_preview(update: Update, uid: str, data: dict, is_edit: bool, origi
             "preview_name": preview_name,
         }
 
-        kb = InlineKeyboardMarkup([
+        buttons = [
             [InlineKeyboardButton("🌐 افتح المعاينة", url=preview_url)],
             [InlineKeyboardButton("✅ نشر الموقع", callback_data="confirm_publish"),
              InlineKeyboardButton("✏️ تعديل أكثر", callback_data="continue_edit")],
-        ])
+        ]
+        # زر الرجوع يظهر فقط لو فيه نسخة سابقة محفوظة لهذا المشروع بالذات (يعني هذا تعديل، مو بناء أول مرة)
+        if original_proj and original_proj in LAST_VERSION:
+            buttons.append([InlineKeyboardButton("↩️ رجوع للنسخة السابقة", callback_data="undo_edit")])
+
+        kb = InlineKeyboardMarkup(buttons)
         await update.message.reply_text(
             f"👀 هذي معاينة موقعك — افتحها وشوفها قبل ما تقرر:\n🔗 {preview_url}\n\n"
-            f"إذا عجبتك اضغط «نشر الموقع»، أو «تعديل أكثر» لمواصلة التحسين.",
+            f"إذا عجبتك اضغط «نشر الموقع»، أو «تعديل أكثر» لمواصلة التحسين"
+            + (" أو «رجوع» لاسترجاع النسخة قبل هذا التعديل." if original_proj and original_proj in LAST_VERSION else "."),
             reply_markup=kb,
         )
     except Exception as e:
@@ -320,13 +331,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """مضمون يرد دائماً — أي خطأ غير متوقع يُمسك في try/except خارجي شامل."""
     uid = str(update.message.from_user.id)
     try:
-        if uid not in EDIT_MODE:
-            await update.message.reply_text(
-                "📸 استلمت الصورة، لكن الصور تُستخدم فقط أثناء تعديل موقع موجود.\n"
-                "روح /my واضغط ✏️ تعديل تحت موقعك، ثم أرسل الصورة."
-            )
-            return
-
         await _typing(update)
         saved = await _save_photo(update, uid)
 
@@ -343,18 +347,56 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         caption = (update.message.caption or "").strip()
 
-        if caption:
-            proj = EDIT_MODE.pop(uid)
-            _track(uid, "images")
-            data = await _do_edit(update, uid, caption, proj, image_url=saved["url"], image_path=saved["path"])
-            if data:
-                await _do_preview(update, uid, data, is_edit=True, original_proj=proj)
-        else:
-            PENDING_IMAGE[uid] = saved
+        # ── الحالة 1: بوضع تعديل موقع منشور فعلاً ──
+        if uid in EDIT_MODE:
+            if caption:
+                proj = EDIT_MODE.pop(uid)
+                _track(uid, "images")
+                data = await _do_edit(update, uid, caption, proj, image_url=saved["url"], image_path=saved["path"])
+                if data:
+                    await _do_preview(update, uid, data, is_edit=True, original_proj=proj)
+            else:
+                PENDING_IMAGE[uid] = saved
+                await update.message.reply_text(
+                    "📸 استلمت الصورة بنجاح. أرسل الآن وصف كيف تريد استخدامها:\n"
+                    "مثلاً: خلي اللوقو هذي الصورة / هذا المنتج حط له هذي الصورة."
+                )
+            return
+
+        # ── الحالة 2: أول استخدام / محادثة تخطيط (لا يوجد موقع منشور بعد) ──
+        # نسمح بإرسال صورة + وصف مباشرة من البداية، تماماً كما كانت تعمل سابقاً.
+        if not caption:
             await update.message.reply_text(
-                "📸 استلمت الصورة بنجاح. أرسل الآن وصف كيف تريد استخدامها:\n"
-                "مثلاً: خلي اللوقو هذي الصورة / هذا المنتج حط له هذي الصورة."
+                "📸 استلمت الصورة. أرسل وصفاً معها يوضح فكرة الموقع المطلوب "
+                "(مثلاً: سوّي متجر إلكترونيات وخلي هذي الصورة اللوقو)."
             )
+            # نخزنها لنفس مسار وضع التعديل بالصور حتى تُستخدم بأول طلب بناء قادم
+            PENDING_IMAGE[uid] = saved
+            return
+
+        history = PLANNING.setdefault(uid, [])
+        history.append({"role": "user", "content": f"{caption} [صورة مرفقة: {saved['url']}]"})
+
+        try:
+            reply_text, ready = plan_chat(history)
+        except RuntimeError as e:
+            log(f"[PLAN_CHAT_PHOTO_FAIL] uid={uid} err={e}")
+            await update.message.reply_text("⚠️ المحرك مشغول الآن، حاول إعادة الإرسال بعد لحظة.")
+            return
+
+        history.append({"role": "assistant", "content": reply_text})
+
+        if not ready:
+            await update.message.reply_text(reply_text)
+            return
+
+        await update.message.reply_text(reply_text)
+        data = await _do_build_from_conversation(update, uid, history)
+        PLANNING.pop(uid, None)
+        PENDING_IMAGE.pop(uid, None)
+
+        if data:
+            await _do_preview(update, uid, data, is_edit=False, original_proj=None)
 
     except Exception as e:
         log(f"[PHOTO_HANDLER_FATAL] uid={uid} err={e}")
@@ -393,7 +435,13 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ── محادثة تخطيط قبل البناء ──────────────
         # نتراكم رسائل المستخدم بهذا السياق إلى أن يقرر AI نفسه إنه فهم وجاهز للبناء
         history = PLANNING.setdefault(uid, [])
-        history.append({"role": "user", "content": text})
+
+        pending_img = PENDING_IMAGE.pop(uid, None)
+        if pending_img:
+            history.append({"role": "user", "content": f"{text} [صورة مرفقة: {pending_img['url']}]"})
+            _track(uid, "images")
+        else:
+            history.append({"role": "user", "content": text})
 
         await _typing(update)
         try:
@@ -464,6 +512,36 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✏️ تمام، أرسل الآن التغييرات التي تريدها على المعاينة.\n"
             "بعد التعديل سأعرض لك معاينة جديدة قبل النشر."
         )
+        return
+
+    if q.data == "undo_edit":
+        pending = PENDING_BUILD.get(uid)
+        if not pending or not pending.get("proj"):
+            await q.message.reply_text("⚠️ لا توجد نسخة سابقة محفوظة بهذه اللحظة.")
+            return
+
+        original_proj = pending["proj"]
+        backup = LAST_VERSION.get(original_proj)
+        if not backup:
+            await q.message.reply_text("⚠️ لا توجد نسخة سابقة محفوظة لهذا المشروع.")
+            return
+
+        await q.message.reply_text(f"↩️ جاري استرجاع النسخة السابقة من {original_proj}...")
+        try:
+            restore_data = {"projectName": original_proj, "files": backup["files"]}
+            build_project(restore_data, uid)
+            url = deploy_project(original_proj, backup["files"])
+            add_project(uid, original_proj, url, backup["files"])
+            LAST_VERSION.pop(original_proj, None)
+            PENDING_BUILD.pop(uid, None)
+            log(f"[UNDO_OK] uid={uid} proj={original_proj}")
+            await q.message.reply_text(
+                f"✅ تم استرجاع النسخة السابقة بنجاح!\n\n📛 {original_proj}\n🔗 {url}",
+                reply_markup=_project_keyboard(original_proj, url),
+            )
+        except Exception as e:
+            log(f"[UNDO_ERR] uid={uid} proj={original_proj} err={e}")
+            await q.message.reply_text("❌ فشل استرجاع النسخة السابقة.")
         return
 
     if "|" not in q.data:
