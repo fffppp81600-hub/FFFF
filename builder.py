@@ -79,3 +79,4 @@ def build_project(data: dict, user_id: str) -> bool:
 
     log(f"[BUILDER_OK] user={user_id} proj={project_name} written={written}/{len(files)}")
     return written >= len(REQUIRED_FILES)
+  
