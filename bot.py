@@ -1,5 +1,6 @@
 """
 bot.py — Telegram bot — يحفظ المشاريع بشكل دائم في قاعدة بيانات.
+مضمون الرد دائماً على أي صورة أو رسالة (try/except شامل في كل هاندلر).
 """
 import os
 import time
@@ -28,18 +29,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 _cooldown: dict  = {}
 EDIT_MODE: dict  = {}
 USER_STATS: dict = {}
-PENDING_IMAGE: dict = {}  # uid -> {"path": local_path, "url": public_url} — صورة مرسلة بدون نص بانتظار التعليمات
+PENDING_IMAGE: dict = {}
 
-# مجلد رفع الصور — نفس مجلد المواقع اللي يخدمه server.py عبر مسار /s/<name>/<filename>
 SITES_DIR = os.path.join(os.path.dirname(__file__), "sites")
 UPLOADS_DIR = os.path.join(SITES_DIR, "_uploads")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-# الرابط العام للسيرفر (لازم يكون صحيح عشان رابط الصورة يفتح فعلياً داخل الموقع المبني)
-PUBLIC_BASE = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
+# نفس متغير BASE_URL المستخدم في deploy.py — لازم يكون مضبوط بـ Render
+PUBLIC_BASE = os.getenv("BASE_URL", "").rstrip("/")
 
 
-# ── Helpers ───────────────────────────────────
 def _allow(uid: str, seconds: int = 8):
     now = time.time()
     if now - _cooldown.get(uid, 0) < seconds:
@@ -50,11 +49,9 @@ def _allow(uid: str, seconds: int = 8):
 
 
 def _track(uid: str, action: str):
-    s = USER_STATS.setdefault(uid, {"builds": 0, "edits": 0, "last_active": ""})
-    if action == "build":
-        s["builds"] += 1
-    elif action == "edit":
-        s["edits"] += 1
+    s = USER_STATS.setdefault(uid, {"builds": 0, "edits": 0, "images": 0, "last_active": ""})
+    if action in s:
+        s[action] += 1
     s["last_active"] = datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
@@ -104,44 +101,25 @@ def _project_keyboard(proj_name: str, url: str) -> InlineKeyboardMarkup:
     ])
 
 
-# ── Commands ──────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.from_user.first_name or "صديقي"
     await update.message.reply_text(
         f"👋 أهلاً {name}!\n\n"
         "أنا بوت بناء المواقع بالذكاء الاصطناعي 🤖\n\n"
-        "🔥 ما أقدر أسويه:\n"
-        "• مواقع متاجر إلكترونية كاملة\n"
-        "• ألعاب تفاعلية في المتصفح\n"
-        "• لوحات تحكم ودashboards\n"
-        "• أي موقع تتخيله!\n\n"
-        "📌 فقط أرسل وصف ما تريد وسأبنيه وأنشره فوراً 🚀\n\n"
-        "الأوامر:\n"
-        "/help — شرح مفصل\n"
-        "/my — مشاريعك\n"
-        "/stats — إحصائياتك\n"
-        "/cancel — إلغاء التعديل"
+        "📌 أرسل وصف ما تريد وسأبنيه وأنشره فوراً 🚀\n"
+        "📷 وقت التعديل تقدر ترسل صور (لوقو/منتجات) لدمجها بالموقع.\n\n"
+        "/help — شرح مفصل\n/my — مشاريعك\n/stats — إحصائياتك\n/cancel — إلغاء التعديل"
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 دليل الاستخدام\n\n"
-        "🏗 بناء موقع جديد:\n"
-        "أرسل وصفاً تفصيلياً لما تريد.\n"
-        "مثال: سوّي متجر ملابس بألوان داكنة فيه 3 أقسام وسلة تسوق\n\n"
-        "✏️ تعديل موقع:\n"
-        "اضغط زر تعديل تحت الموقع، ثم أرسل ما تريد تغييره.\n"
-        "تقدر ترسل صورة وقت التعديل (مع نص أو بدونه) لاستخدامها كلوقو، أو لتطبيق لون "
-        "الصورة على الموقع، أو كصورة لمنتج معيّن.\n\n"
-        "💡 نصائح:\n"
-        "• كن تفصيلياً في الوصف\n"
-        "• حدد الألوان والأقسام\n"
-        "• اذكر الميزات المهمة (سلة، دفع، تسجيل...)\n\n"
-        "⚙️ الأوامر:\n"
-        "/my — مشاريعك النشطة\n"
-        "/stats — إحصائياتك\n"
-        "/cancel — إلغاء وضع التعديل"
+        "🏗 بناء موقع جديد: أرسل وصفاً تفصيلياً.\n\n"
+        "✏️ تعديل: اضغط زر تعديل، ثم أرسل نص أو صورة (مع وصف أو بدونه).\n\n"
+        "📷 صورة بدون نص: نسألك وصف الاستخدام بعدها.\n"
+        "📷 صورة مع نص: نطبّق التعديل فوراً.\n\n"
+        "/my — مشاريعك\n/stats — إحصائياتك\n/cancel — إلغاء التعديل"
     )
 
 
@@ -151,7 +129,6 @@ async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not projects:
         await update.message.reply_text("📭 لا توجد مشاريع نشطة.\n\nأرسل وصف موقعك لإنشاء أول مشروع! 🚀")
         return
-
     await update.message.reply_text(f"📂 مشاريعك ({len(projects)}):")
     for p in projects:
         await update.message.reply_text(
@@ -163,14 +140,11 @@ async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.message.from_user.id)
-    s = USER_STATS.get(uid, {"builds": 0, "edits": 0, "last_active": "—"})
+    s = USER_STATS.get(uid, {"builds": 0, "edits": 0, "images": 0, "last_active": "—"})
     projects = get_projects(uid)
     await update.message.reply_text(
-        f"📊 إحصائياتك:\n\n"
-        f"🏗 مواقع بُنيت: {s['builds']}\n"
-        f"✏️ تعديلات: {s['edits']}\n"
-        f"📂 مشاريع نشطة: {len(projects)}\n"
-        f"🕐 آخر نشاط: {s['last_active']}"
+        f"📊 إحصائياتك:\n\n🏗 مواقع: {s['builds']}\n✏️ تعديلات: {s['edits']}\n"
+        f"📷 صور: {s.get('images', 0)}\n📂 نشطة: {len(projects)}\n🕐 آخر نشاط: {s['last_active']}"
     )
 
 
@@ -184,27 +158,20 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ لست في وضع التعديل حالياً.")
 
 
-# ── Build ──────────────────────────────────────
 async def _do_build(update: Update, uid: str, text: str):
     await _typing(update)
-    await update.message.reply_text(
-        "⚙️ جاري بناء موقعك...\n"
-        "المحرك الذكي يحلل طلبك ويولد الكود 🧠"
-    )
+    await update.message.reply_text("⚙️ جاري بناء موقعك...\nالمحرك الذكي يحلل طلبك 🧠")
     try:
         log(f"[BUILD] uid={uid} req={text[:100]}")
         data = safe_parse(builder(text))
         if not data:
             raise ValueError("safe_parse=None")
-        _track(uid, "build")
+        _track(uid, "builds")
         log(f"[BUILD_OK] uid={uid} proj={data.get('projectName')}")
         return data
     except RuntimeError as e:
         log(f"[BUILD_FAIL] uid={uid} err={e}")
-        await update.message.reply_text(
-            "⚠️ المحرك مشغول الآن، جاري رفع صفحة مؤقتة.\n"
-            "أعد الطلب بعد لحظة للحصول على الموقع الكامل."
-        )
+        await update.message.reply_text("⚠️ المحرك مشغول الآن، جاري رفع صفحة مؤقتة.\nأعد الطلب بعد لحظة.")
         return _fallback(text, uid)
     except Exception as e:
         log(f"[BUILD_ERR] uid={uid} err={e}")
@@ -212,17 +179,12 @@ async def _do_build(update: Update, uid: str, text: str):
         return _fallback(text, uid)
 
 
-# ── Edit ───────────────────────────────────────
 async def _do_edit(update: Update, uid: str, text: str, proj: str,
                     image_url: Optional[str] = None, image_path: Optional[str] = None):
     await _typing(update)
     await update.message.reply_text(f"🔄 معالجة التعديلات على {proj}...")
 
-    # أولاً جرّب من القرص، وإلا من قاعدة البيانات
-    local = get_project_files(uid, proj)
-    if not local:
-        local = get_project_files_db(uid, proj)
-
+    local = get_project_files(uid, proj) or get_project_files_db(uid, proj)
     current = ""
     if local:
         for f in local:
@@ -236,7 +198,7 @@ async def _do_edit(update: Update, uid: str, text: str, proj: str,
         if not data:
             raise ValueError("safe_parse=None")
         data["projectName"] = proj
-        _track(uid, "edit")
+        _track(uid, "edits")
         log(f"[EDIT_OK] uid={uid} proj={proj}")
         return data
     except RuntimeError as e:
@@ -249,32 +211,24 @@ async def _do_edit(update: Update, uid: str, text: str, proj: str,
         return None
 
 
-# ── Deploy ─────────────────────────────────────
 async def _do_deploy(update: Update, uid: str, data: dict):
     await _typing(update)
     await update.message.reply_text("📦 رفع الملفات...")
     try:
         build_project(data, uid)
         url = deploy_project(data["projectName"], data.get("files", []))
-        # حفظ دائم في قاعدة البيانات (يشمل محتوى الملفات لاسترجاعها بعد إعادة التشغيل)
         add_project(uid, data["projectName"], url, data.get("files", []))
         log(f"[DEPLOY_OK] uid={uid} proj={data['projectName']} url={url}")
-
         await update.message.reply_text(
-            f"✅ موقعك جاهز!\n\n"
-            f"📛 الاسم: {data['projectName']}\n"
-            f"🔗 {url}\n\n"
-            f"استخدم الأزرار للتحكم بموقعك 👇",
+            f"✅ موقعك جاهز!\n\n📛 الاسم: {data['projectName']}\n🔗 {url}\n\nاستخدم الأزرار 👇",
             reply_markup=_project_keyboard(data["projectName"], url),
         )
     except Exception as e:
         log(f"[DEPLOY_ERR] uid={uid} err={e}")
-        await update.message.reply_text("❌ فشل الرفع. تحقق من إعدادات السيرفر.")
+        await update.message.reply_text("❌ فشل الرفع. تحقق من إعدادات السيرفر (BASE_URL).")
 
 
-# ── Image upload ────────────────────────────────
 async def _save_photo(update: Update, uid: str) -> Optional[dict]:
-    """يحمّل أعلى دقة من الصورة المرسلة محلياً، ويبني رابطها العام عبر مسار /s/_uploads/ الذي يخدمه server.py."""
     try:
         photo = update.message.photo[-1]
         tg_file = await photo.get_file()
@@ -283,10 +237,10 @@ async def _save_photo(update: Update, uid: str) -> Optional[dict]:
         await tg_file.download_to_drive(local_path)
 
         if not PUBLIC_BASE:
-            log(f"[IMG_WARN] uid={uid} PUBLIC_URL/RENDER_EXTERNAL_URL غير مضبوط — لن يتولّد رابط عام صالح")
+            log(f"[IMG_WARN] uid={uid} BASE_URL غير مضبوط")
             return {"path": local_path, "url": ""}
 
-        url = f"{PUBLIC_BASE.rstrip('/')}/s/_uploads/{filename}"
+        url = f"{PUBLIC_BASE}/s/_uploads/{filename}"
         log(f"[IMG_OK] uid={uid} url={url}")
         return {"path": local_path, "url": url}
     except Exception as e:
@@ -295,72 +249,90 @@ async def _save_photo(update: Update, uid: str) -> Optional[dict]:
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """مضمون يرد دائماً — أي خطأ غير متوقع يُمسك في try/except خارجي شامل."""
     uid = str(update.message.from_user.id)
+    try:
+        if uid not in EDIT_MODE:
+            await update.message.reply_text(
+                "📸 استلمت الصورة، لكن الصور تُستخدم فقط أثناء تعديل موقع موجود.\n"
+                "روح /my واضغط ✏️ تعديل تحت موقعك، ثم أرسل الصورة."
+            )
+            return
 
-    if uid not in EDIT_MODE:
-        await update.message.reply_text(
-            "📸 استلمت الصورة، لكن الصور تُستخدم فقط أثناء تعديل موقع موجود.\n"
-            "اضغط زر ✏️ تعديل تحت موقعك، ثم أرسل الصورة."
-        )
-        return
+        await _typing(update)
+        saved = await _save_photo(update, uid)
 
-    saved = await _save_photo(update, uid)
-    if not saved or not saved["url"]:
-        await update.message.reply_text(
-            "⚠️ تعذّر حفظ الصورة أو توليد رابط عام لها. "
-            "تأكد إن متغيّر PUBLIC_URL (أو RENDER_EXTERNAL_URL) مضبوط بالسيرفر."
-        )
-        return
+        if not saved:
+            await update.message.reply_text("⚠️ حدث خطأ أثناء حفظ الصورة. حاول مرة أخرى.")
+            return
 
-    caption = (update.message.caption or "").strip()
+        if not saved["url"]:
+            await update.message.reply_text(
+                "⚠️ تعذّر توليد رابط عام للصورة لأن BASE_URL غير مضبوط بالسيرفر.\n"
+                "أضف متغير BASE_URL في Render Environment Variables بقيمة رابط موقعك (https://...)."
+            )
+            return
 
-    if caption:
-        # صورة + تعليمات بنفس الرسالة → تنفيذ التعديل فوراً
-        proj = EDIT_MODE.pop(uid)
-        data = await _do_edit(update, uid, caption, proj, image_url=saved["url"], image_path=saved["path"])
-        if data:
-            await _do_deploy(update, uid, data)
-    else:
-        # صورة بدون نص → تُخزَّن وتُربط تلقائياً بالرسالة النصية القادمة
-        PENDING_IMAGE[uid] = saved
-        await update.message.reply_text(
-            "📸 استلمت الصورة. أرسل الآن وصف كيف تريد استخدامها:\n"
-            "مثلاً: خلي اللوقو هذي الصورة / لون الصفحة نفس لون الصورة / هذا المنتج حط له هذي الصورة."
-        )
+        caption = (update.message.caption or "").strip()
 
-
-# ── Main message handler ───────────────────────
-async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid  = str(update.message.from_user.id)
-    text = update.message.text.strip()
-
-    if not text:
-        await update.message.reply_text("⚠️ الرسالة فارغة، أرسل وصف موقعك.")
-        return
-
-    allowed, remaining = _allow(uid)
-    if not allowed:
-        await update.message.reply_text(f"⏳ انتظر {remaining} ثانية بين الطلبات.")
-        return
-
-    if uid in EDIT_MODE:
-        proj = EDIT_MODE.pop(uid)
-        pending = PENDING_IMAGE.pop(uid, None)
-        if pending:
-            data = await _do_edit(update, uid, text, proj,
-                                   image_url=pending["url"], image_path=pending["path"])
+        if caption:
+            proj = EDIT_MODE.pop(uid)
+            _track(uid, "images")
+            data = await _do_edit(update, uid, caption, proj, image_url=saved["url"], image_path=saved["path"])
+            if data:
+                await _do_deploy(update, uid, data)
         else:
-            data = await _do_edit(update, uid, text, proj)
-    else:
-        data = await _do_build(update, uid, text)
+            PENDING_IMAGE[uid] = saved
+            await update.message.reply_text(
+                "📸 استلمت الصورة بنجاح. أرسل الآن وصف كيف تريد استخدامها:\n"
+                "مثلاً: خلي اللوقو هذي الصورة / هذا المنتج حط له هذي الصورة."
+            )
 
-    if not data:
-        return
+    except Exception as e:
+        log(f"[PHOTO_HANDLER_FATAL] uid={uid} err={e}")
+        try:
+            await update.message.reply_text("❌ حدث خطأ غير متوقع أثناء معالجة الصورة. حاول مرة أخرى أو أرسل /cancel.")
+        except Exception:
+            pass
 
-    await _do_deploy(update, uid, data)
+
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.message.from_user.id)
+    try:
+        text = (update.message.text or "").strip()
+        if not text:
+            await update.message.reply_text("⚠️ الرسالة فارغة، أرسل وصف موقعك.")
+            return
+
+        allowed, remaining = _allow(uid)
+        if not allowed:
+            await update.message.reply_text(f"⏳ انتظر {remaining} ثانية بين الطلبات.")
+            return
+
+        if uid in EDIT_MODE:
+            proj = EDIT_MODE.pop(uid)
+            pending = PENDING_IMAGE.pop(uid, None)
+            if pending:
+                _track(uid, "images")
+                data = await _do_edit(update, uid, text, proj, image_url=pending["url"], image_path=pending["path"])
+            else:
+                data = await _do_edit(update, uid, text, proj)
+        else:
+            data = await _do_build(update, uid, text)
+
+        if not data:
+            return
+
+        await _do_deploy(update, uid, data)
+
+    except Exception as e:
+        log(f"[HANDLE_FATAL] uid={uid} err={e}")
+        try:
+            await update.message.reply_text("❌ حدث خطأ غير متوقع. حاول مرة أخرى أو أرسل /cancel.")
+        except Exception:
+            pass
 
 
-# ── Callback buttons ───────────────────────────
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -376,21 +348,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "edit":
         EDIT_MODE[uid] = proj
         await q.message.reply_text(
-            f"✏️ وضع تعديل: {proj}\n\n"
-            f"أرسل الآن التغييرات التي تريدها بالتفصيل، أو أرسل صورة (مع وصف أو بدونه).\n"
-            f"للإلغاء: /cancel"
+            f"✏️ وضع تعديل: {proj}\n\nأرسل التغييرات بالتفصيل، أو صورة (مع وصف أو بدونه).\nللإلغاء: /cancel"
         )
-
     elif action == "del":
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ نعم، احذف", callback_data=f"confirm_del|{proj}"),
              InlineKeyboardButton("❌ إلغاء", callback_data=f"cancel_del|{proj}")],
         ])
-        await q.message.reply_text(
-            f"⚠️ هل أنت متأكد من حذف {proj}؟\n\nلا يمكن التراجع عن هذا الإجراء.",
-            reply_markup=kb
-        )
-
+        await q.message.reply_text(f"⚠️ هل أنت متأكد من حذف {proj}؟", reply_markup=kb)
     elif action == "confirm_del":
         await q.message.reply_text(f"🗑 جاري حذف {proj}...")
         try:
@@ -398,14 +363,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log(f"[DEL_LOCAL_ERR] proj={proj} err={e}")
         delete_project_files(uid, proj)
-        delete_project(uid, proj)  # يحذف من قاعدة البيانات أيضاً
+        delete_project(uid, proj)
         await q.message.reply_text(f"✅ تم حذف {proj} بنجاح.")
-
     elif action == "cancel_del":
         await q.message.reply_text("↩️ تم إلغاء الحذف.")
 
 
-# ── Entry point ────────────────────────────────
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler("start",  cmd_start))
 app.add_handler(CommandHandler("help",   cmd_help))
