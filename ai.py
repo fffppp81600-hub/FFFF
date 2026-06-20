@@ -110,7 +110,11 @@ BUILD_PROMPT = """Build a complete, production-ready website.
 
 REQUEST: {request}
 
-Think about implicit needs beyond what's literally written and include them.
+CRITICAL RULE: Only build what the user actually asked for. If they specified a product category
+(e.g. electronics), every product/section must belong to that category — never invent unrelated
+categories or products. Fill in realistic details (names, prices, images) WITHIN what was requested,
+never outside its scope.
+
 Implement every feature fully. Premium design. Arabic = RTL + Cairo font.
 Stores need working filters, cart, and simulated checkout.
 
@@ -324,6 +328,70 @@ def _call(prompt: str, retries: int = 5, check_store: bool = False) -> str:
             time.sleep(3 * i)
 
     raise RuntimeError(f"Groq failed {retries}x across {len(_clients)} key(s). Last: {last_err} | raw[:300]={(last_raw or '')[:300]}")
+
+
+PLANNING_SYSTEM = """أنت مساعد تخطيط مواقع ودود. مهمتك محصورة بهذي الخطوة فقط:
+1. تفهم فكرة الموقع من كلام المستخدم بدقة، بدون تخترع تفاصيل لم يذكرها.
+2. تردّ بإيجاز (2-4 جمل) تلخّص فهمك وتسأل عن أي تفصيل مهم ناقص (نوع المنتجات، الألوان، الأقسام، الميزات).
+3. لا تكتب أي كود أبداً في هذه المرحلة — فقط محادثة نصية.
+4. حلّل آخر رسالة من المستخدم: هل فيها نية واضحة أنه جاهز للبناء الآن (مثل: يلا، ابدأ، سويها، انشرها، تمام كذا، جاهز، ماشي ابدأ)؟
+   - لو نعم: ابدأ ردك بالضبط بـ "[READY]" ثم رسالة قصيرة تؤكد إنك بادئ البناء الآن.
+   - لو لا (لسه يشرح/يضيف تفاصيل أو يسأل): ابدأ ردك بـ "[CONTINUE]" ثم ردك التفاعلي العادي.
+هذا التصنيف [READY] أو [CONTINUE] إلزامي في أول كلمة من ردك دائماً."""
+
+
+def plan_chat(conversation: list) -> tuple[str, bool]:
+    """
+    محادثة تخطيط قبل البناء — تحلل كامل السياق وتقرر هل المستخدم جاهز للبناء الآن أو لسه يوضّح.
+    conversation: قائمة [{"role": "user"/"assistant", "content": "..."}] بكامل تاريخ محادثة التخطيط.
+    يرجع (نص الرد للمستخدم, جاهز_للبناء: bool).
+    """
+    messages = [{"role": "system", "content": PLANNING_SYSTEM}] + conversation
+
+    last_err = None
+    for i in range(1, 4):
+        try:
+            client = _get_client()
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                temperature=0.5,
+                max_tokens=300,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if raw.startswith("[READY]"):
+                return raw.replace("[READY]", "", 1).strip(), True
+            if raw.startswith("[CONTINUE]"):
+                return raw.replace("[CONTINUE]", "", 1).strip(), False
+            # لو ما التزم بالتصنيف، نعتبره استمرار محادثة عادي (أأمن افتراض)
+            return raw, False
+        except Exception as e:
+            last_err = e
+            err_text = str(e).lower()
+            if ("429" in err_text or "rate_limit" in err_text) and len(_clients) > 1:
+                _rotate_key()
+            time.sleep(2 * i)
+
+    raise RuntimeError(f"Groq planning chat failed: {last_err}")
+
+
+def build_from_conversation(conversation: list) -> str:
+    """
+    يبني الموقع من كامل محادثة التخطيط (مو من رسالة واحدة) — يضمن عدم اختراع تفاصيل
+    لم يذكرها المستخدم عبر كل المحادثة، ويستخدم كل ما قاله حرفياً كمتطلبات.
+    """
+    full_request = "\n".join(
+        f"{'المستخدم' if m['role'] == 'user' else 'البوت'}: {m['content']}"
+        for m in conversation
+    )
+    prompt = BUILD_PROMPT.format(request=full_request) + (
+        "\n\nمهم جداً: التزم حرفياً بكل ما ورد في المحادثة أعلاه فقط. "
+        "لا تضف نوع منتجات أو فكرة أو قسم لم يُذكر صراحة في كلام المستخدم. "
+        "إذا ذكر المستخدم نوع منتجات معيّن (مثل إلكترونيات)، يجب أن تكون كل المنتجات في هذا الموقع "
+        "من هذا النوع فقط، ولا تخترع أقسام أو منتجات من نوع مختلف."
+    )
+    full_text = "\n".join(m["content"] for m in conversation)
+    return _call(prompt, check_store=_looks_like_store(full_text))
 
 
 def builder(request: str) -> str:
