@@ -407,11 +407,18 @@ def build_from_conversation(conversation: list) -> str:
     يبني الموقع من كامل محادثة التخطيط (مو من رسالة واحدة) — يضمن عدم اختراع تفاصيل
     لم يذكرها المستخدم عبر كل المحادثة، ويستخدم كل ما قاله حرفياً كمتطلبات.
     لو الطلب يحتاج روابط حقيقية (فيديوهات/مواقع)، يبحث عنها فعلياً قبل البناء ويحقنها بالـ prompt.
+
+    ملاحظة مهمة: نأخذ فقط رسائل المستخدم (نتجاهل ردود البوت التوضيحية) ونحدّ طولها،
+    لأن محادثات طويلة جداً تكبّر الـ prompt وتجعل Groq يقطع مخرجات الملفات قبل اكتمالها
+    (سبب شائع لخطأ "Content too short in style.css").
     """
-    full_request = "\n".join(
-        f"{'المستخدم' if m['role'] == 'user' else 'البوت'}: {m['content']}"
-        for m in conversation
-    )
+    user_only = [m["content"] for m in conversation if m["role"] == "user"]
+    full_request = "\n".join(user_only)
+
+    # لو المحادثة طويلة جداً، نقتصر على أهم جزء (أول رسالة فيها الفكرة + آخر 3 رسائل توضيح)
+    if len(user_only) > 5:
+        trimmed = [user_only[0]] + user_only[-3:]
+        full_request = "\n".join(trimmed)
 
     links_block = ""
     if web_search.is_search_available():
@@ -421,14 +428,13 @@ def build_from_conversation(conversation: list) -> str:
             links_block = web_search.format_links_for_prompt(results)
 
     prompt = BUILD_PROMPT.format(request=full_request) + (
-        "\n\nمهم جداً: التزم حرفياً بكل ما ورد في المحادثة أعلاه فقط. "
+        "\n\nمهم جداً: التزم حرفياً بكل ما ورد أعلاه فقط. "
         "لا تضف نوع منتجات أو فكرة أو قسم لم يُذكر صراحة في كلام المستخدم. "
         "إذا ذكر المستخدم نوع منتجات معيّن (مثل إلكترونيات)، يجب أن تكون كل المنتجات في هذا الموقع "
         "من هذا النوع فقط، ولا تخترع أقسام أو منتجات من نوع مختلف."
     ) + links_block
 
-    full_text = "\n".join(m["content"] for m in conversation)
-    return _call(prompt, check_store=_looks_like_store(full_text))
+    return _call(prompt, check_store=_looks_like_store(full_request))
 
 
 def builder(request: str) -> str:
