@@ -112,3 +112,4 @@ def safe_parse(text: str) -> dict | None:
         return None
 
     return data
+  
