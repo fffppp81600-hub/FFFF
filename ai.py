@@ -352,7 +352,7 @@ def _call(prompt: str, retries: int = 5, check_store: bool = False) -> str:
         except ValueError as e:
             last_err = f"Validation error attempt {i}: {e}"
         except Exception as e:
-            last_err = f"API error attempt {i}: {e}"
+            last_err = f"API error attempt {i}: {type(e).__name__}: {e}"
             err_text = str(e).lower()
             if ("429" in err_text or "rate_limit" in err_text or "tokens per minute" in err_text) and len(_clients) > 1:
                 _rotate_key()
