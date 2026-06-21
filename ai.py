@@ -21,6 +21,7 @@ import time
 from typing import Optional
 from dotenv import load_dotenv
 from groq import Groq
+import httpx
 import web_search
 
 load_dotenv()
@@ -49,7 +50,14 @@ for _i in range(2, 11):
 if not _API_KEYS:
     raise RuntimeError("لا يوجد أي GROQ_API_KEY في متغيرات البيئة!")
 
-_clients = [Groq(api_key=k, timeout=60.0) for k in _API_KEYS]
+_clients = [
+    Groq(
+        api_key=k,
+        timeout=60.0,
+        http_client=httpx.Client(http2=False),
+    )
+    for k in _API_KEYS
+]
 _current_key_index = 0  # يبدأ من أول مفتاح، يتقدّم عند فشل المفتاح الحالي
 
 
@@ -352,7 +360,9 @@ def _call(prompt: str, retries: int = 5, check_store: bool = False) -> str:
         except ValueError as e:
             last_err = f"Validation error attempt {i}: {e}"
         except Exception as e:
-            last_err = f"API error attempt {i}: {type(e).__name__}: {e}"
+            cause = getattr(e, "__cause__", None)
+            cause_info = f" | cause={type(cause).__name__}: {cause}" if cause else ""
+            last_err = f"API error attempt {i}: {type(e).__name__}: {e}{cause_info}"
             err_text = str(e).lower()
             if ("429" in err_text or "rate_limit" in err_text or "tokens per minute" in err_text) and len(_clients) > 1:
                 _rotate_key()
