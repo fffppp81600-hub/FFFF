@@ -1,6 +1,7 @@
 python-telegram-bot
 python-dotenv
 groq
+httpx
 flask
 requests
 pydantic
