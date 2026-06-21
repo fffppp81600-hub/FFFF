@@ -373,6 +373,57 @@ async def _do_rename_title(update: Update, uid: str, proj: str, new_title: str):
         await update.message.reply_text("❌ فشل تحديث العنوان. حاول مرة أخرى.")
 
 
+# ── حذف خلفية الصورة فعلياً (rembg محلياً، بدون أي API خارجي) ─────
+def _wants_bg_removal(text: str) -> bool:
+    """يكتشف لو النص فعلياً يطلب حذف خلفية صورة (مو تغيير لون خلفية الموقع)."""
+    t = (text or "").lower()
+    has_bg_word = ("خلفي" in t) or ("background" in t)
+    has_action_word = any(w in t for w in [
+        "حذف", "شيل", "ازل", "ازال", "مسح", "بدون", "شفاف", "transparent", "remove", "without",
+    ])
+    return has_bg_word and has_action_word
+
+
+def _remove_background(local_path: str) -> str:
+    """
+    يحذف خلفية الصورة فعلياً بالذكاء الاصطناعي محلياً (rembg، نموذج u2netp الخفيف) ويرجع
+    مسار PNG شفاف جديد. لو فشلت المعالجة لأي سبب (مكتبة غير مثبتة، خطأ بالنموذج...)
+    يرجع المسار الأصلي كما هو بدون توقف العملية.
+    """
+    try:
+        from rembg import remove, new_session
+        session = new_session("u2netp")  # أخف نموذج متاح — يناسب موارد Render المجانية
+        with open(local_path, "rb") as f:
+            output_bytes = remove(f.read(), session=session)
+        new_path = os.path.splitext(local_path)[0] + "_nobg.png"
+        with open(new_path, "wb") as f:
+            f.write(output_bytes)
+        return new_path
+    except Exception as e:
+        log(f"[BG_REMOVE_ERR] path={local_path} err={e}")
+        return local_path
+
+
+def _path_to_public_url(local_path: str) -> str:
+    if not PUBLIC_BASE:
+        return ""
+    return f"{PUBLIC_BASE}/s/_uploads/{os.path.basename(local_path)}"
+
+
+def _process_image_for_instruction(saved: dict, instruction_text: str) -> dict:
+    """
+    لو النص يطلب حذف خلفية فعلياً، يعالج الصورة ويرجع {"path","url"} جديدة لنسخة شفافة.
+    غير ذلك يرجع نفس saved بدون أي تغيير.
+    """
+    if not _wants_bg_removal(instruction_text):
+        return saved
+    new_path = _remove_background(saved["path"])
+    if new_path == saved["path"]:
+        return saved
+    new_url = _path_to_public_url(new_path) or saved["url"]
+    return {"path": new_path, "url": new_url}
+
+
 async def _save_photo(update: Update, uid: str) -> Optional[dict]:
     try:
         photo = update.message.photo[-1]
@@ -418,6 +469,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if caption:
                 proj = EDIT_MODE.pop(uid)
                 _track(uid, "images")
+                saved = _process_image_for_instruction(saved, caption)
                 data = await _do_edit(update, uid, caption, proj, image_url=saved["url"], image_path=saved["path"])
                 if data:
                     await _do_preview(update, uid, data, is_edit=True, original_proj=proj)
@@ -441,6 +493,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         history = PLANNING.setdefault(uid, [])
+        saved = _process_image_for_instruction(saved, caption)
         history.append({"role": "user", "content": f"{caption} [صورة مرفقة: {saved['url']}]"})
 
         try:
@@ -495,6 +548,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pending = PENDING_IMAGE.pop(uid, None)
             if pending:
                 _track(uid, "images")
+                pending = _process_image_for_instruction(pending, text)
                 data = await _do_edit(update, uid, text, proj, image_url=pending["url"], image_path=pending["path"])
             else:
                 data = await _do_edit(update, uid, text, proj)
@@ -509,6 +563,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pending_img = PENDING_IMAGE.pop(uid, None)
         if pending_img:
+            pending_img = _process_image_for_instruction(pending_img, text)
             history.append({"role": "user", "content": f"{text} [صورة مرفقة: {pending_img['url']}]"})
             _track(uid, "images")
         else:
