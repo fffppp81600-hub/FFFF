@@ -135,6 +135,9 @@ REAL LINKS RULE: If real links are provided under "روابط حقيقية" in t
 never invent alternative URLs. For YouTube links, convert watch?v=ID to embed/ID inside an <iframe>.
 For other links, use plain <a href> tags with the provided titles.
 
+SCRIPT.JS RULE: If the page is purely static (no interactivity needed), script.js can be minimal —
+include at least one small enhancement like a fade-in animation on load, instead of leaving it empty.
+
 FORBIDDEN: placeholder text like "Product 1"/"Lorem ipsum", stub functions, broken category filters,
 fake payment claims, AND adding any store/product/cart elements when none were requested."""
 
@@ -262,10 +265,14 @@ def _validate(data: dict) -> None:
         raise ValueError(f"Missing files: {missing}")
     for f in data["files"]:
         content = f.get("content", "")
-        # حد أدنى منخفض جداً (10 حرف) — فقط لرفض ملف فاضي تماماً أو شبه فاضي،
-        # وليس لرفض صفحات بسيطة شرعية قد يكون CSS/JS فيها قصيراً نسبياً وهذا طبيعي.
+        path = f.get("path", "")
+        # script.js مسموح يكون فاضياً تماماً — بعض الصفحات البسيطة (شعار/خلفية فقط)
+        # لا تحتاج أي جافاسكربت فعلياً، وهذا قرار سليم من AI مو خطأ.
+        if path == "script.js" and content.strip() == "":
+            continue
+        # باقي الملفات (index.html, style.css) لازم محتوى حقيقي على الأقل
         if len(content.strip()) < 10:
-            raise ValueError(f"Content essentially empty in {f.get('path')} (len={len(content.strip())})")
+            raise ValueError(f"Content essentially empty in {path} (len={len(content.strip())})")
 
 
 def _looks_like_store(text: str) -> bool:
