@@ -40,12 +40,12 @@ MODEL = "llama-3.3-70b-versatile"
 # ─────────────────────────────────────────────
 _API_KEYS = []
 _first_key = os.getenv("GROQ_API_KEY")
-if _first_key:
-    _API_KEYS.append(_first_key)
+if _first_key and _first_key.strip():
+    _API_KEYS.append(_first_key.strip())
 for _i in range(2, 11):
     _k = os.getenv(f"GROQ_API_KEY_{_i}")
-    if _k:
-        _API_KEYS.append(_k)
+    if _k and _k.strip():
+        _API_KEYS.append(_k.strip())
 
 if not _API_KEYS:
     raise RuntimeError("لا يوجد أي GROQ_API_KEY في متغيرات البيئة!")
