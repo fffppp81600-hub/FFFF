@@ -6,6 +6,4 @@ flask
 requests
 pydantic
 pillow
-libsql-client
-rembg
-onnxruntime
+libsql
