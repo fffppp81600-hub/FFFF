@@ -261,8 +261,11 @@ def _validate(data: dict) -> None:
     if missing:
         raise ValueError(f"Missing files: {missing}")
     for f in data["files"]:
-        if len(f.get("content", "").strip()) < 50:
-            raise ValueError(f"Content too short in {f.get('path')}")
+        content = f.get("content", "")
+        # حد أدنى منخفض جداً (10 حرف) — فقط لرفض ملف فاضي تماماً أو شبه فاضي،
+        # وليس لرفض صفحات بسيطة شرعية قد يكون CSS/JS فيها قصيراً نسبياً وهذا طبيعي.
+        if len(content.strip()) < 10:
+            raise ValueError(f"Content essentially empty in {f.get('path')} (len={len(content.strip())})")
 
 
 def _looks_like_store(text: str) -> bool:
@@ -334,7 +337,7 @@ def _call(prompt: str, retries: int = 5, check_store: bool = False) -> str:
             resp = client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
-                temperature=0.7,
+                temperature=0.4,
                 max_tokens=8000,
                 response_format={"type": "json_object"},
             )
@@ -370,7 +373,7 @@ def _call(prompt: str, retries: int = 5, check_store: bool = False) -> str:
         if i < retries:
             time.sleep(3 * i)
 
-    raise RuntimeError(f"Groq failed {retries}x across {len(_clients)} key(s). Last: {last_err} | raw[:300]={(last_raw or '')[:300]}")
+    raise RuntimeError(f"Groq failed {retries}x across {len(_clients)} key(s). Last: {last_err} | raw_full={last_raw}")
 
 
 PLANNING_SYSTEM = """أنت مساعد تخطيط مواقع ودود. مهمتك محصورة بهذي الخطوة فقط:
