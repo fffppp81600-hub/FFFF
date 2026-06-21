@@ -49,7 +49,7 @@ for _i in range(2, 11):
 if not _API_KEYS:
     raise RuntimeError("لا يوجد أي GROQ_API_KEY في متغيرات البيئة!")
 
-_clients = [Groq(api_key=k) for k in _API_KEYS]
+_clients = [Groq(api_key=k, timeout=60.0) for k in _API_KEYS]
 _current_key_index = 0  # يبدأ من أول مفتاح، يتقدّم عند فشل المفتاح الحالي
 
 
