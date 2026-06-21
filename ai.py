@@ -327,7 +327,7 @@ def _call(prompt: str, retries: int = 5, check_store: bool = False) -> str:
                 model=MODEL,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=7000,
+                max_tokens=10000,
                 response_format={"type": "json_object"},
             )
             last_raw = resp.choices[0].message.content.strip()
