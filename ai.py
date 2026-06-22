@@ -1,18 +1,10 @@
 """
 ai.py — Groq (Llama 3.3 70B) — محرك بناء وتعديل مواقع بفهم عميق للسياق.
 
-الميزات الفعلية الحالية:
-  - محادثة تخطيط قبل البناء (plan_chat): يرد على المستخدم ويسأل عن تفاصيل ناقصة،
-    ولا يعتبر الطلب جاهزاً للبناء إلا لما يكتشف فعلياً نية تأكيد واضحة بالسياق
-  - بناء من كامل المحادثة (build_from_conversation): يلتزم حرفياً بكل ما ذكره المستخدم
-    عبر كل رسائله، ويُمنع صريحاً من اختراع أقسام/منتجات/ميزات لم تُذكر
-  - استنتاج الميزات الضمنية المنطقية فقط لما يُذكر (متجر = سلة + دفع تلقائياً)، بدون
-    تخمين تفاصيل محتوى لم يُصرَّح بها
-  - تلخيص الكود الحالي تلقائياً قبل التعديل + ضغطه لتقليل استهلاك التوكنات
-  - تصنيف نوع طلب التعديل (تصميم / إضافة ميزة / حذف / تصحيح خطأ / محتوى)
-  - دعم صورة مرفقة من المستخدم: رابط مباشر + استخراج لونها السائد محلياً (Pillow)
-  - نظام تناوب مفاتيح Groq (حتى 10 مفاتيح) — يتحول تلقائياً عند تجاوز حد التوكنات
-  - max_tokens وحجم prompt مضبوطين ليبقوا تحت حد Groq المجاني (12000 توكن/دقيقة)
+التحسينات في هذا الإصدار:
+  ① البوت أذكى: PLANNING_SYSTEM محسّن — يسأل أسئلة أعمق، يفهم نوع الموقع، يقترح أفكار ذكية
+  ② AI أفضل: BASE_SYSTEM محسّن — تعليمات تصميم أغنى، أنيميشن احترافية، UX أعلى مستوى
+  ③ جودة المواقع: تفاصيل بصرية متقدمة، micro-interactions، خطوط وألوان متناسقة
 """
 import os
 import re
@@ -32,11 +24,7 @@ MODEL = "llama-3.3-70b-versatile"
 # نظام تناوب المفاتيح (Key Rotation)
 # يدعم من مفتاح واحد إلى 10 مفاتيح. يضاف بـ .env كالتالي:
 #   GROQ_API_KEY=key1
-#   GROQ_API_KEY_2=key2
-#   GROQ_API_KEY_3=key3
-#   ... إلى GROQ_API_KEY_10
-# عند فشل مفتاح (حد التوكنات/الكوتة)، ينتقل تلقائياً للمفتاح التالي بدون أي تدخل،
-# والسياق (الكود الحالي للمشروع) محفوظ بقاعدة البيانات لا بالمفتاح، فلا حاجة لإعادة شرح الفكرة.
+#   GROQ_API_KEY_2=key2  ...  GROQ_API_KEY_10=key10
 # ─────────────────────────────────────────────
 _API_KEYS = []
 _first_key = os.getenv("GROQ_API_KEY")
@@ -58,7 +46,7 @@ _clients = [
     )
     for k in _API_KEYS
 ]
-_current_key_index = 0  # يبدأ من أول مفتاح، يتقدّم عند فشل المفتاح الحالي
+_current_key_index = 0
 
 
 def _get_client():
@@ -66,165 +54,234 @@ def _get_client():
 
 
 def _rotate_key() -> bool:
-    """
-    يتقدّم للمفتاح التالي. يرجع True لو فيه مفتاح آخر لم نجربه بهذه الدورة، False لو رجعنا لأول مفتاح
-    (يعني جربنا كل المفاتيح المتاحة ولا واحد منها نجح).
-    """
     global _current_key_index
     _current_key_index = (_current_key_index + 1) % len(_clients)
     return _current_key_index != 0
 
 
 def _is_quota_error(exc: Exception) -> bool:
-    """يكتشف لو الخطأ بسبب حد التوكنات/الكوتة تحديداً (مو خطأ آخر غير مرتبط بالمفتاح)."""
     msg = str(exc).lower()
     return any(s in msg for s in ["429", "rate_limit", "quota", "tokens per minute", "request too large"])
 
 
+# ═══════════════════════════════════════════════════════════════════
+# ① BASE_SYSTEM — محسّن لجودة كود وتصميم أعلى
+# ═══════════════════════════════════════════════════════════════════
+BASE_SYSTEM = """You are a world-class Senior Frontend Engineer, Creative Director, and UI/UX Specialist AI.
+You don't just build websites — you craft digital experiences. Before writing a single line, you deeply analyze
+the user's true intent, their audience, and the emotional tone the site should convey.
 
-BASE_SYSTEM = """You are an elite Senior Frontend Engineer, Game Developer, and UI/UX Designer AI. You think deeply before coding: you infer the user's true intent, including features they implied but didn't explicitly state.
-
-OUTPUT CONTRACT — NEVER VIOLATE:
-Return ONLY a raw JSON object. No markdown. No backticks. No explanation.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT CONTRACT — NEVER VIOLATE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Return ONLY a raw JSON object. No markdown. No backticks. No explanation. No preamble.
 First char = {   Last char = }
 
 JSON STRUCTURE:
 {"projectName": "kebab-case-max-30-chars", "files": [{"path": "index.html", "content": "..."}, {"path": "style.css", "content": "..."}, {"path": "script.js", "content": "..."}]}
 
-TECHNOLOGY RULES:
-- Pure vanilla HTML5 + CSS3 + ES6 JS ONLY. NO React/Vue/npm/imports.
-- Tailwind v4 CDN in index.html: <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-- index.html must link style.css and script.js properly.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TECHNOLOGY STACK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Pure vanilla HTML5 + CSS3 + ES6 JS ONLY. NO React/Vue/npm/build tools.
+- Tailwind v4 CDN: <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+- index.html must link style.css (<link rel="stylesheet" href="style.css">) and script.js (<script src="script.js" defer></script>).
+- Google Fonts via CDN only. Default Arabic: Cairo + Tajawal. Default Latin: Inter + Poppins.
 
-SCOPE RULE — THE MOST IMPORTANT RULE, NEVER VIOLATE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SCOPE RULE — MOST IMPORTANT, NEVER VIOLATE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Build EXACTLY what the user asked for — nothing more, nothing less.
-- If the user asked for a simple page (logo, title, background, animation), build ONLY that. Do NOT add
-  products, categories, a cart, prices, or any e-commerce elements unless the user explicitly asked for
-  a store/shop/products.
-- Do NOT assume a brand name implies a store. A name + logo + background request is a simple branded
-  page, not an e-commerce site, unless words like "متجر" (store) / "منتجات" (products) / "بيع" (sell) /
-  "اقسام" (categories) / "سلة" (cart) actually appear in the request.
-- The E-COMMERCE MANDATORY LOGIC section below applies ONLY when the user's request clearly describes
-  a store with products to sell. For every other request, ignore that section completely.
+- Simple page request (logo + name + background + animation) = build ONLY that. Zero e-commerce elements.
+- A brand name does NOT imply a store. Only add cart/products/checkout if words like
+  "متجر / منتجات / بيع / سلة / store / shop / cart / products" actually appear.
+- The E-COMMERCE section below applies ONLY when a store was explicitly requested.
 
-DEEP UNDERSTANDING — THINK LIKE A PRODUCT OWNER (applies only within what was actually requested):
-- "Store/متجر" implies: working cart, category nav, product images, prices, checkout — even if unstated
-- "Game/لعبة" implies: score, win/lose, restart button
-- "Dashboard" implies: charts, stat cards, sidebar
-- Vague wording ("خله احلى") = visual polish only, never change structure
-- "غير اللون" without specifying = apply to primary brand color consistently
-- Never silently delete a feature the user didn't ask to remove
-- Never silently ADD a feature/section/category the user didn't ask for, even if it "feels natural"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+② DEEP PRODUCT THINKING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Think like a product owner AND a creative director simultaneously:
+- "متجر/Store" → working cart, category nav, product grid, prices, checkout flow, empty-state messages
+- "لعبة/Game" → score counter, win/lose screen, restart, sound feedback (Web Audio API if fitting)
+- "داشبورد/Dashboard" → animated stat cards, Chart.js via CDN charts, sidebar with active states
+- "بورتفوليو/Portfolio" → smooth scroll, project cards with hover reveal, skills progress bars, contact form
+- "مطعم/Restaurant" → menu sections, item cards with images, reservation form, opening hours
+- "صفحة هبوط/Landing" → hero with CTA, features grid, testimonials, FAQ accordion, footer
+- Vague polish request ("خله احلى") → upgrade visuals only, never touch logic or structure
+- Color-only request → apply consistently to all brand touchpoints, never touch JS logic
 
-DESIGN: premium gradients, glassmorphism, animations, hover states, dark theme default, fully responsive.
-ARABIC: Arabic request = dir="rtl" lang="ar", Cairo/Tajawal font.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+③ PREMIUM DESIGN SYSTEM (apply to EVERY project)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COLORS & GRADIENTS:
+- Default: rich dark theme. Background: #0a0a0f or #0d0d1a. Cards: rgba(255,255,255,0.04).
+- Primary accent: choose one bold color that fits the brand (electric blue #6366f1, emerald #10b981,
+  amber #f59e0b, rose #f43f5e, violet #8b5cf6). Never use generic grey.
+- Gradients: always multi-stop. Example: linear-gradient(135deg, #667eea 0%, #764ba2 100%).
+- Glassmorphism cards: background: rgba(255,255,255,0.05); backdrop-filter: blur(20px);
+  border: 1px solid rgba(255,255,255,0.1); box-shadow: 0 8px 32px rgba(0,0,0,0.3).
 
-CONTENT: Implement every feature mentioned or implied. Realistic content, real product names/prices —
-but ONLY if a store was actually requested (see SCOPE RULE above).
-Stores: product photos from https://picsum.photos/seed/SEEDNAME/400/500 (unique seed each).
+TYPOGRAPHY:
+- Headings: bold/black weight (700-900), tight letter-spacing for impact.
+- Body: 400-500 weight, comfortable line-height (1.6-1.8).
+- Never mix more than 2 font families.
+- Arabic text: always font-family Cairo or Tajawal, dir="rtl", text-align: right.
 
-E-COMMERCE MANDATORY LOGIC (ONLY IF a store/products/cart was explicitly requested — otherwise skip entirely):
-- ALL products in one JS array {id,name,category,price,image}
-- Category buttons filter the SAME array via one shared function — never separate disconnected sections
-- Real cart state (let cart=[]), add-to-cart updates visible badge count
-- Cart icon top-left opens panel with items/remove/subtotal/checkout button
-- Checkout: address input, order summary, Apple Pay styled button (visual simulation only, never real payment)
-- Every step must work with zero dead buttons
+ANIMATIONS & MICRO-INTERACTIONS (mandatory, not optional):
+- Page load: elements fade-in + slide-up with staggered delays (0.1s apart).
+  Use IntersectionObserver for scroll-triggered animations — never animate everything on load.
+- Buttons: scale(1.05) on hover + box-shadow glow effect matching brand color.
+- Cards: translateY(-8px) + enhanced shadow on hover, transition 0.3s ease.
+- Links/nav items: underline slide-in animation on hover.
+- Loading states: skeleton screens or pulse animation — never blank white.
+- Scroll progress bar at top of page (thin colored line).
+- Smooth scroll behavior: html { scroll-behavior: smooth; }
 
-REAL LINKS RULE: If real links are provided under "روابط حقيقية" in the request, use them EXACTLY as given —
-never invent alternative URLs. For YouTube links, convert watch?v=ID to embed/ID inside an <iframe>.
-For other links, use plain <a href> tags with the provided titles.
+LAYOUT:
+- Always fully responsive: mobile-first, breakpoints at 640px / 768px / 1024px / 1280px.
+- Use CSS Grid for complex layouts, Flexbox for alignment.
+- Generous whitespace: padding/margin should feel spacious, never cramped.
+- Max content width: 1200px centered with auto margins.
 
-SCRIPT.JS RULE: If the page is purely static (no interactivity needed), script.js can be minimal —
-include at least one small enhancement like a fade-in animation on load, instead of leaving it empty.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+E-COMMERCE MANDATORY LOGIC (ONLY if store explicitly requested)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- ALL products in one JS array: {id, name, category, price, image, description, rating}
+- Category filter buttons operate on the SAME array via one shared renderProducts() function
+- Cart state: let cart = []; persisted to localStorage
+- Cart icon (fixed top corner) shows live badge count, opens slide-in panel
+- Cart panel: item list with quantities, remove button, subtotal, checkout CTA
+- Checkout: name + address form, order summary, simulated payment button (never claim real payment)
+- Search bar filters products in real-time as user types
+- Product cards: image, name, price, rating stars, "أضف للسلة" button — all functional
+- Empty cart state: friendly message with shopping icon
+- Every single button must work — zero dead UI
 
-FORBIDDEN: placeholder text like "Product 1"/"Lorem ipsum", stub functions, broken category filters,
-fake payment claims, AND adding any store/product/cart elements when none were requested."""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONTENT & ASSETS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Product images: https://picsum.photos/seed/UNIQUESEED/400/500 (different seed per product)
+- Hero backgrounds: https://picsum.photos/seed/HEROSEED/1600/900
+- Icons: use Unicode emoji or simple CSS shapes — never leave icon placeholders
+- Real Arabic content: never use Lorem ipsum. Use realistic Arabic names, descriptions, prices.
+- Prices in SAR (ريال) for Arabic sites.
+
+REAL LINKS RULE: If "روابط حقيقية" section exists in request, use those URLs EXACTLY.
+YouTube watch?v=ID → embed/ID in <iframe>. Other links → <a href="..."> with provided title.
+
+SCRIPT.JS: Even static pages need script.js with at least: scroll progress bar + IntersectionObserver
+fade-in + one micro-interaction. Never leave it truly empty.
+
+FORBIDDEN: Lorem ipsum, "Product 1" placeholders, stub functions, broken filters,
+fake payment claims, adding store elements when none were requested, empty script.js."""
 
 
-BUILD_PROMPT = """Build a complete, production-ready website.
+# ═══════════════════════════════════════════════════════════════════
+# BUILD PROMPT — محسّن
+# ═══════════════════════════════════════════════════════════════════
+BUILD_PROMPT = """Build a complete, production-ready, visually stunning website.
 
 REQUEST: {request}
 
-CRITICAL RULE: Only build EXACTLY what the user asked for — nothing more.
-- If the request does NOT explicitly mention a store/products/cart/categories, do NOT add any of them.
-  A request for a logo + name + background animation is a simple branded page, not a store.
-- If they DID specify a product category (e.g. electronics), every product/section must belong to
-  that category — never invent unrelated categories or products.
-- Fill in realistic details (names, prices, images) WITHIN what was requested, never outside its scope.
+CRITICAL SCOPE RULE:
+- Build ONLY what was explicitly requested — nothing more.
+- No store/cart/products unless the request clearly asks for them.
+- If a product category was mentioned (e.g. electronics), ALL products must be from that category only.
 
-Implement every feature fully. Premium design. Arabic = RTL + Cairo font.
-Only add cart/filters/checkout if the request is actually a store.
+QUALITY CHECKLIST (every item must be ✓ before returning):
+✓ Premium dark design with rich gradients and glassmorphism cards
+✓ Scroll-triggered fade-in animations via IntersectionObserver
+✓ Button hover effects (scale + glow)
+✓ Card hover effects (lift + shadow)
+✓ Fully responsive (mobile → desktop)
+✓ Realistic Arabic content (no Lorem ipsum, no "Product 1")
+✓ script.js has scroll progress bar + animations at minimum
+✓ All interactive elements actually work
 
-Return ONLY the JSON object."""
+Return ONLY the JSON object. No explanation."""
 
 
-EDIT_PROMPT = """Modify this existing website. Understand it before changing anything.
+# ═══════════════════════════════════════════════════════════════════
+# EDIT PROMPT — محسّن
+# ═══════════════════════════════════════════════════════════════════
+EDIT_PROMPT = """You are editing an existing website. Read and fully understand the current code before making ANY change.
 
-SUMMARY: {code_summary}
+CURRENT SITE SUMMARY: {code_summary}
 
 CURRENT CODE:
 {current_code}
 
 EDIT REQUEST: {edit_request}
 
-Apply the change completely across all files that need it. Never remove a working feature unless asked.
-Return ALL 3 files complete, even unchanged ones. Return ONLY the JSON object."""
+EDITING RULES:
+1. Apply the requested change precisely — never touch unrelated parts.
+2. Never silently remove a working feature unless explicitly asked.
+3. If adding a visual element, match the existing design language exactly.
+4. If fixing a bug, fix only that bug — don't refactor the whole file.
+5. Return ALL 3 files complete and correct, even if only one file changed.
+6. Preserve all existing animations and interactions unless asked to change them.
+
+Return ONLY the JSON object."""
 
 
 # ─────────────────────────────────────────────
-# Code compression — critical for staying under Groq free-tier TPM limit
+# Code compression
 # ─────────────────────────────────────────────
 def compress_code_for_prompt(current_code: str, max_chars: int = 7000) -> str:
-    """
-    يضغط الكود الحالي قبل إرساله لتقليل استهلاك التوكنات (حد Groq المجاني: 12000 توكن/دقيقة).
-    يحذف المسافات الزائدة بدون كسر بنية الكود، ويقتطع الزيادة مع تنبيه واضح للنموذج.
-    """
     if not current_code:
         return current_code
     compressed = re.sub(r"[ \t]{2,}", " ", current_code)
     compressed = re.sub(r"\n{3,}", "\n\n", compressed)
     if len(compressed) <= max_chars:
         return compressed
-    return compressed[:max_chars] + "\n\n[...الباقي مقتطع لتجاوز الحد. حافظ على ما لم يظهر كاملاً كما هو.]"
+    return compressed[:max_chars] + "\n\n[...الباقي مقتطع. حافظ على كل ما لم يظهر كما هو.]"
 
 
 def summarize_code(current_code: str) -> str:
-    """تلخيص سريع للكود الحالي بدون استدعاء AI إضافي."""
     if not current_code or len(current_code.strip()) < 20:
-        return "لا يوجد كود سابق — مشروع جديد بالكامل."
+        return "لا يوجد كود سابق — مشروع جديد."
     lower = current_code.lower()
     features = []
     checks = [
-        (["cart", "سلة"], "سلة تسوق"),
-        (["category", "قسم", "filter"], "فلترة/أقسام"),
-        (["apple pay", "checkout", "دفع"], "صفحة دفع"),
-        (["score", "game"], "منطق لعبة"),
-        (["chart", "canvas"], "رسوم بيانية"),
-        (["cairo", 'dir="rtl"'], "موقع عربي RTL"),
+        (["cart", "سلة", "addtocart"],           "سلة تسوق"),
+        (["category", "قسم", "filter"],           "فلترة/أقسام"),
+        (["apple pay", "checkout", "دفع"],        "صفحة دفع"),
+        (["score", "game", "لعبة"],               "منطق لعبة"),
+        (["chart", "canvas", "recharts"],         "رسوم بيانية"),
+        (["cairo", 'dir="rtl"', "tajawal"],       "موقع عربي RTL"),
+        (["intersectionobserver", "scroll"],      "أنيميشن تمرير"),
+        (["localstorage", "sessionstorage"],      "تخزين محلي"),
+        (["fetch(", "xmlhttprequest", "axios"],   "طلبات API"),
+        (["modal", "popup", "dialog"],            "نوافذ منبثقة"),
     ]
     for keywords, label in checks:
         if any(k in lower for k in keywords):
             features.append(label)
-    return f"الميزات الحالية: {', '.join(features)}." if features else "موقع بسيط."
+
+    # استخراج عنوان الصفحة
+    title_match = re.search(r"<title>(.*?)</title>", current_code, re.IGNORECASE)
+    title_info = f" | عنوان: {title_match.group(1)}" if title_match else ""
+
+    return (f"الميزات: {', '.join(features)}{title_info}." if features
+            else f"موقع بسيط{title_info}.")
 
 
 def classify_edit_intent(edit_request: str) -> str:
-    """تصنيف سريع لنوع طلب التعديل."""
-    vague_markers = ["احلى", "افضل", "حسن", "طور", "زيد شي", "ضيف شي"]
-    if any(m in edit_request for m in vague_markers) and len(edit_request.split()) < 5:
+    vague_markers = ["احلى", "افضل", "حسن", "طور", "زيد شي", "ضيف شي", "جمّل", "حسّن"]
+    if any(m in edit_request for m in vague_markers) and len(edit_request.split()) < 6:
         return "vague_polish"
-    if any(w in edit_request for w in ["حذف", "شيل", "ازل", "remove", "delete"]):
+    if any(w in edit_request for w in ["حذف", "شيل", "ازل", "امسح", "remove", "delete"]):
         return "removal"
-    if any(w in edit_request for w in ["لون", "تصميم", "شكل", "خط", "style", "color"]):
+    if any(w in edit_request for w in ["لون", "تصميم", "شكل", "خط", "خلفية", "style", "color", "font", "background"]):
         return "style_only"
-    if any(w in edit_request for w in ["لا يعمل", "ما يعمل", "خطأ", "مشكلة", "bug", "fix"]):
+    if any(w in edit_request for w in ["لا يعمل", "ما يعمل", "خطأ", "مشكلة", "مكسور", "bug", "fix", "error"]):
         return "bug_fix"
+    if any(w in edit_request for w in ["عنوان", "title", "اسم الموقع", "اسم الصفحة"]):
+        return "title_change"
     return "feature_or_content"
 
 
 def extract_dominant_color(image_path: str) -> Optional[str]:
-    """يستخرج اللون السائد من صورة محلية (hex code) — الموديل نصي ولا يرى الصورة فعلياً."""
     try:
         from PIL import Image
         img = Image.open(image_path).convert("RGB").resize((50, 50))
@@ -239,18 +296,17 @@ def extract_dominant_color(image_path: str) -> Optional[str]:
 
 
 def _build_image_instruction(image_url: Optional[str], image_path: Optional[str]) -> str:
-    """تعليمات مختصرة للـ AI عن الصورة المرفقة — مضغوطة لتقليل التوكنات."""
     if not image_url:
         return ""
     dominant = extract_dominant_color(image_path) if image_path else None
     block = f"\n\n[صورة مرفقة: {image_url}]"
     if dominant:
-        block += f" [لون سائد: {dominant}]"
+        block += f" [اللون السائد: {dominant} — استخدمه كلون أساسي للموقع]"
     block += (
-        " لوقو=استخدم الرابط كـ src للوقو في index.html. "
-        "لون الصفحة=طبّق اللون السائد على العناصر الأساسية بـ style.css. "
-        "صورة منتج معيّن=غيّر فقط image لذلك المنتج بمصفوفة script.js."
-    )
+        " إذا كانت لوقو: ضعها كـ <img src='{url}'> في الهيدر بارتفاع 60-80px مع padding مناسب. "
+        "إذا كانت صورة منتج: غيّر image لذلك المنتج فقط في مصفوفة script.js. "
+        "إذا كانت خلفية أو ديكور: ضعها كـ background-image في الـ hero section."
+    ).replace("{url}", image_url)
     return block
 
 
@@ -266,21 +322,13 @@ def _validate(data: dict) -> None:
     for f in data["files"]:
         content = f.get("content", "")
         path = f.get("path", "")
-        # script.js مسموح يكون فاضياً تماماً — بعض الصفحات البسيطة (شعار/خلفية فقط)
-        # لا تحتاج أي جافاسكربت فعلياً، وهذا قرار سليم من AI مو خطأ.
         if path == "script.js" and content.strip() == "":
             continue
-        # باقي الملفات (index.html, style.css) لازم محتوى حقيقي على الأقل
         if len(content.strip()) < 10:
-            raise ValueError(f"Content essentially empty in {path} (len={len(content.strip())})")
+            raise ValueError(f"Content empty in {path} (len={len(content.strip())})")
 
 
 def _looks_like_store(text: str) -> bool:
-    """
-    يفحص كلمات دالة على متجر/منتجات بحدود كلمة كاملة لتجنّب إيجابيات خاطئة
-    (مثل "محلي" أو "تسوقها" تطابق جزئياً مع "محل"/"تسوق" لو كان الفحص بسيط).
-    استُبعدت "محل" من القائمة لأنها كثيرة الالتباس بالعربي (محلي، محلات، بمحل إقامتي...).
-    """
     keywords = ["متجر", "منتجات", "منتج", "سلة التسوق", "سلة المشتريات", "بيع المنتجات",
                 "store", "shop", "cart", "products", "e-commerce", "ecommerce"]
     return any(k in text for k in keywords)
@@ -299,9 +347,7 @@ def _extract_json(text: str) -> str:
     start = text.find("{")
     if start == -1:
         raise ValueError("No { found")
-    depth = 0
-    in_str = False
-    esc = False
+    depth, in_str, esc = 0, False, False
     for i in range(start, len(text)):
         c = text[i]
         if esc:
@@ -335,7 +381,7 @@ def _call(prompt: str, retries: int = 5, check_store: bool = False) -> str:
     last_err = last_raw = None
     messages = [
         {"role": "system", "content": BASE_SYSTEM},
-        {"role": "user", "content": prompt},
+        {"role": "user",   "content": prompt},
     ]
 
     for i in range(1, retries + 1):
@@ -344,7 +390,7 @@ def _call(prompt: str, retries: int = 5, check_store: bool = False) -> str:
             resp = client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
-                temperature=0.4,
+                temperature=0.45,
                 max_tokens=8000,
                 response_format={"type": "json_object"},
             )
@@ -359,9 +405,11 @@ def _call(prompt: str, retries: int = 5, check_store: bool = False) -> str:
             _validate(data)
 
             if check_store:
-                js_content = next((f["content"] for f in data["files"] if f["path"] == "script.js"), "")
+                js_content = next(
+                    (f["content"] for f in data["files"] if f["path"] == "script.js"), ""
+                )
                 if not _has_cart_logic(js_content):
-                    raise ValueError("متجر بدون منطق سلة حقيقي — إعادة المحاولة")
+                    raise ValueError("متجر بدون منطق سلة — إعادة المحاولة")
 
             return extracted
 
@@ -373,31 +421,47 @@ def _call(prompt: str, retries: int = 5, check_store: bool = False) -> str:
             cause = getattr(e, "__cause__", None)
             cause_info = f" | cause={type(cause).__name__}: {cause}" if cause else ""
             last_err = f"API error attempt {i}: {type(e).__name__}: {e}{cause_info}"
-            err_text = str(e).lower()
-            if ("429" in err_text or "rate_limit" in err_text or "tokens per minute" in err_text) and len(_clients) > 1:
+            if _is_quota_error(e) and len(_clients) > 1:
                 _rotate_key()
 
         if i < retries:
             time.sleep(3 * i)
 
-    raise RuntimeError(f"Groq failed {retries}x across {len(_clients)} key(s). Last: {last_err} | raw_full={last_raw}")
+    raise RuntimeError(
+        f"Groq failed {retries}x across {len(_clients)} key(s). Last: {last_err} | raw={last_raw}"
+    )
 
 
-PLANNING_SYSTEM = """أنت مساعد تخطيط مواقع ودود. مهمتك محصورة بهذي الخطوة فقط:
-1. تفهم فكرة الموقع من كلام المستخدم بدقة، بدون تخترع تفاصيل لم يذكرها.
-2. تردّ بإيجاز (2-4 جمل) تلخّص فهمك وتسأل عن أي تفصيل مهم ناقص (نوع المنتجات، الألوان، الأقسام، الميزات).
-3. لا تكتب أي كود أبداً في هذه المرحلة — فقط محادثة نصية.
-4. حلّل آخر رسالة من المستخدم: هل فيها نية واضحة أنه جاهز للبناء الآن (مثل: يلا، ابدأ، سويها، انشرها، تمام كذا، جاهز، ماشي ابدأ)؟
-   - لو نعم: ابدأ ردك بالضبط بـ "[READY]" ثم رسالة قصيرة تؤكد إنك بادئ البناء الآن.
-   - لو لا (لسه يشرح/يضيف تفاصيل أو يسأل): ابدأ ردك بـ "[CONTINUE]" ثم ردك التفاعلي العادي.
-هذا التصنيف [READY] أو [CONTINUE] إلزامي في أول كلمة من ردك دائماً."""
+# ═══════════════════════════════════════════════════════════════════
+# ① PLANNING_SYSTEM — محسّن: أذكى + أعمق + يقترح + يفهم نوع الموقع
+# ═══════════════════════════════════════════════════════════════════
+PLANNING_SYSTEM = """أنت مستشار مواقع ذكي وودود، خبير في UX وبناء المنتجات الرقمية.
+مهمتك في هذه المرحلة: تفهم بعمق ما يريده المستخدم وتساعده يوضح فكرته قبل البناء.
+
+كيف تتصرف:
+1. حلل نوع الموقع المطلوب: هل هو متجر؟ لعبة؟ بورتفوليو؟ صفحة هبوط؟ داشبورد؟ مطعم؟ غيره؟
+2. بناءً على النوع، اسأل عن التفاصيل المهمة الناقصة فقط (لا تسأل عن شيء واضح بالفعل):
+   - متجر → نوع المنتجات؟ عدد الأقسام؟ هل يبغى سلة كاملة؟
+   - لعبة → نوع اللعبة؟ مستوى الصعوبة؟ للموبايل أو الكمبيوتر؟
+   - بورتفوليو → مجاله؟ أبرز مشاريعه؟ هل يبغى نموذج تواصل؟
+   - صفحة هبوط → المنتج/الخدمة؟ الجمهور المستهدف؟ هل فيه CTA؟
+   - مطعم → نوع الأكل؟ هل يبغى قائمة طعام؟ حجز طاولات؟
+3. اقترح فكرة أو ميزة ذكية واحدة بناءً على فهمك (لكن وضّح إنها اقتراح مو إلزامي).
+4. لا تكتب أي كود أبداً — فقط محادثة نصية طبيعية وذكية.
+5. ردودك مختصرة ومباشرة (3-5 جمل) — لا تطول بدون سبب.
+
+قرار الجاهزية:
+- حلّل آخر رسالة: هل فيها نية واضحة للبدء؟ (يلا / ابدأ / سويها / تمام / جاهز / ماشي / انشر / اعملها)
+- لو نعم → ابدأ ردك بـ "[READY]" ثم جملة تأكيد قصيرة بما ستبنيه.
+- لو لا → ابدأ ردك بـ "[CONTINUE]" ثم ردك الطبيعي.
+
+[READY] أو [CONTINUE] إلزامي في أول كلمة دائماً بدون استثناء."""
 
 
 def plan_chat(conversation: list) -> tuple[str, bool]:
     """
-    محادثة تخطيط قبل البناء — تحلل كامل السياق وتقرر هل المستخدم جاهز للبناء الآن أو لسه يوضّح.
-    conversation: قائمة [{"role": "user"/"assistant", "content": "..."}] بكامل تاريخ محادثة التخطيط.
-    يرجع (نص الرد للمستخدم, جاهز_للبناء: bool).
+    محادثة تخطيط ذكية — تحلل السياق الكامل وتقرر هل المستخدم جاهز للبناء.
+    يرجع (نص الرد, جاهز_للبناء: bool).
     """
     messages = [{"role": "system", "content": PLANNING_SYSTEM}] + conversation
 
@@ -408,20 +472,18 @@ def plan_chat(conversation: list) -> tuple[str, bool]:
             resp = client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
-                temperature=0.5,
-                max_tokens=300,
+                temperature=0.55,
+                max_tokens=350,
             )
             raw = resp.choices[0].message.content.strip()
             if raw.startswith("[READY]"):
                 return raw.replace("[READY]", "", 1).strip(), True
             if raw.startswith("[CONTINUE]"):
                 return raw.replace("[CONTINUE]", "", 1).strip(), False
-            # لو ما التزم بالتصنيف، نعتبره استمرار محادثة عادي (أأمن افتراض)
             return raw, False
         except Exception as e:
             last_err = e
-            err_text = str(e).lower()
-            if ("429" in err_text or "rate_limit" in err_text) and len(_clients) > 1:
+            if _is_quota_error(e) and len(_clients) > 1:
                 _rotate_key()
             time.sleep(2 * i)
 
@@ -429,35 +491,24 @@ def plan_chat(conversation: list) -> tuple[str, bool]:
 
 
 def needs_real_links(conversation_text: str) -> Optional[str]:
-    """
-    يكتشف لو المستخدم يطلب محتوى يحتاج روابط حقيقية فعلية (فيديوهات، مواقع، مراجع)
-    ويرجع استعلام بحث مناسب، أو None لو الطلب لا يحتاج بحثاً حقيقياً.
-    اكتشاف بسيط بالكلمات المفتاحية — كافٍ هنا لأن التكلفة (استدعاء بحث خاطئ) منخفضة.
-    """
     triggers = [
         "فيديو", "فيديوهات", "يوتيوب", "youtube", "رابط حقيقي", "روابط حقيقية",
         "منافس", "منافسين", "مواقع تشبه", "أمثلة حقيقية", "حط لي روابط",
         "اعطني روابط", "اعطيني روابط", "افضل", "best", "top",
     ]
     if any(t in conversation_text for t in triggers):
-        return conversation_text[-200:]  # آخر جزء من المحادثة كاستعلام تقريبي
+        return conversation_text[-200:]
     return None
 
 
 def build_from_conversation(conversation: list) -> str:
     """
-    يبني الموقع من كامل محادثة التخطيط (مو من رسالة واحدة) — يضمن عدم اختراع تفاصيل
-    لم يذكرها المستخدم عبر كل المحادثة، ويستخدم كل ما قاله حرفياً كمتطلبات.
-    لو الطلب يحتاج روابط حقيقية (فيديوهات/مواقع)، يبحث عنها فعلياً قبل البناء ويحقنها بالـ prompt.
-
-    ملاحظة مهمة: نأخذ فقط رسائل المستخدم (نتجاهل ردود البوت التوضيحية) ونحدّ طولها،
-    لأن محادثات طويلة جداً تكبّر الـ prompt وتجعل Groq يقطع مخرجات الملفات قبل اكتمالها
-    (سبب شائع لخطأ "Content too short in style.css").
+    يبني الموقع من كامل محادثة التخطيط — يضمن الالتزام بكل ما ذكره المستخدم.
     """
     user_only = [m["content"] for m in conversation if m["role"] == "user"]
     full_request = "\n".join(user_only)
 
-    # لو المحادثة طويلة جداً، نقتصر على أهم جزء (أول رسالة فيها الفكرة + آخر 3 رسائل توضيح)
+    # لو المحادثة طويلة جداً، نحتفظ بالفكرة الأساسية + آخر 3 توضيحات
     if len(user_only) > 5:
         trimmed = [user_only[0]] + user_only[-3:]
         full_request = "\n".join(trimmed)
@@ -469,14 +520,13 @@ def build_from_conversation(conversation: list) -> str:
             results = web_search.search_real_links(search_query, max_results=5)
             links_block = web_search.format_links_for_prompt(results)
 
-    prompt = BUILD_PROMPT.format(request=full_request) + (
-        "\n\nمهم جداً جداً: التزم حرفياً بكل ما ورد أعلاه فقط، بدون أي زيادة. "
-        "إذا لم يذكر المستخدم صراحة كلمة متجر/منتجات/سلة/أقسام، فهذا طلب صفحة بسيطة فقط "
-        "(مثل شعار + اسم + خلفية) — لا تضف أي منتجات أو أقسام أو سلة تسوق من عندك أبداً. "
-        "إذا ذكر المستخدم نوع منتجات معيّن (مثل إلكترونيات)، يجب أن تكون كل المنتجات في هذا الموقع "
-        "من هذا النوع فقط، ولا تخترع أقسام أو منتجات من نوع مختلف."
-    ) + links_block
+    scope_reminder = (
+        "\n\nقاعدة الالتزام الصارمة: ابنِ حرفياً ما طلبه المستخدم أعلاه فقط — لا زيادة ولا نقصان. "
+        "إذا لم يذكر صراحة متجر/منتجات/سلة/أقسام → لا تضف أياً منها أبداً. "
+        "إذا ذكر نوع منتجات معين → كل محتوى الموقع من هذا النوع فقط."
+    )
 
+    prompt = BUILD_PROMPT.format(request=full_request) + scope_reminder + links_block
     return _call(prompt, check_store=_looks_like_store(full_request))
 
 
@@ -490,30 +540,32 @@ def editor(
     image_url: Optional[str] = None,
     image_path: Optional[str] = None,
 ) -> str:
-    summary = summarize_code(current_code)
-    intent = classify_edit_intent(edit_request)
-    compressed_code = compress_code_for_prompt(current_code)
+    summary  = summarize_code(current_code)
+    intent   = classify_edit_intent(edit_request)
+    compressed = compress_code_for_prompt(current_code)
 
     intent_hints = {
-        "vague_polish": "[نية: تحسين بصري فقط، لا تغيّر البنية]",
-        "removal": "[نية: حذف دقيق دون التأثير على باقي الميزات]",
-        "style_only": "[نية: تصميم/ألوان فقط، لا تغيّر المنطق]",
-        "bug_fix": "[نية: تصحيح خطأ دون كسر شيء يعمل]",
-        "feature_or_content": "[نية: إضافة ميزة/محتوى متكامل]",
+        "vague_polish":      "[نية: تحسين بصري فقط — لا تغيّر البنية أو المنطق]",
+        "removal":           "[نية: حذف دقيق — لا تؤثر على الميزات الأخرى]",
+        "style_only":        "[نية: تصميم/ألوان فقط — لا تلمس JS أبداً]",
+        "bug_fix":           "[نية: إصلاح خطأ محدد — لا تعيد هيكلة الكود]",
+        "title_change":      "[نية: تغيير عنوان الصفحة <title> فقط في index.html]",
+        "feature_or_content":"[نية: إضافة ميزة/محتوى كامل ومتكامل]",
     }
+
     image_instruction = _build_image_instruction(image_url, image_path)
-    enriched_request = f"{edit_request} {intent_hints.get(intent, '')}{image_instruction}"
+    enriched = f"{edit_request} {intent_hints.get(intent, '')}{image_instruction}"
 
     return _call(
         EDIT_PROMPT.format(
-            current_code=compressed_code or "(no source — new project)",
+            current_code=compressed or "(لا يوجد كود — مشروع جديد)",
             code_summary=summary,
-            edit_request=enriched_request,
+            edit_request=enriched,
         ),
         check_store=_looks_like_store(current_code + edit_request),
     )
 
 
-def planner(text: str) -> str: return builder(text)
-def coder(plan: str) -> str:   return plan
+def planner(text: str) -> str:  return builder(text)
+def coder(plan: str) -> str:    return plan
 def reviewer(code: str) -> str: return code
