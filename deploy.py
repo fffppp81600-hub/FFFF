@@ -1,11 +1,11 @@
 """
 deploy.py — نشر المواقع محلياً على القرص + استرجاعها من Turso بعد كل إعادة تشغيل.
-يشمل أيضاً: حفظ الصور المرفوعة + دالة اختيارية لإزالة خلفية الصور (rembg).
+يشمل أيضاً: حفظ الصور المرفوعة + إزالة الخلفية عبر remove.bg API.
 """
 import os
 import shutil
 import base64
-import io
+import requests
 from logger import log
 
 SITES_DIR = os.path.join(os.path.dirname(__file__), "sites")
@@ -57,48 +57,36 @@ def save_uploaded_image(project_name: str, filename: str, raw_bytes: bytes, mime
     return f"{BASE_URL}/s/{project_name}/uploads/{filename}"
 
 
-_rembg_session = None
-
-
-def _get_rembg_session():
-    """يحمّل موديل rembg مرة واحدة فقط طوال عمر العملية، بدل تحميله من جديد كل طلب."""
-    global _rembg_session
-    if _rembg_session is None:
-        from rembg import new_session
-        _rembg_session = new_session("u2netp")
-    return _rembg_session
-
-
 def remove_background(raw_bytes: bytes) -> bytes:
     """
-    يزيل خلفية صورة باستخدام rembg، ويرجع bytes الصورة الناتجة (PNG شفاف).
-    تحسينات للسرعة على معالج Render المجاني الضعيف:
-    - يصغّر الصورة لأقصى بعد 1000px قبل المعالجة (صور الجوالات تكون أحياناً 3000px+،
-      وحجم الصورة يؤثر بشكل كبير على وقت الاستنتاج).
-    - يعيد استخدام نفس جلسة الموديل المحمّلة مسبقاً بدل تحميلها من جديد كل مرة.
-    لو rembg غير مثبتة أو فشلت لأي سبب، يرجع الصورة الأصلية بدون تعديل (fail-safe).
+    يزيل خلفية صورة عبر remove.bg API ويرجع bytes الصورة الناتجة (PNG شفاف).
+    يتطلب متغير بيئة REMOVE_BG_API_KEY.
+    لو المفتاح غير موجود أو فشل الطلب، يرجع الصورة الأصلية بدون تعديل (fail-safe).
     """
+    api_key = os.getenv("REMOVE_BG_API_KEY", "")
+
+    if not api_key:
+        log("[BG_REMOVE_SKIP] REMOVE_BG_API_KEY غير مضبوط — تخطي إزالة الخلفية")
+        return raw_bytes
+
     try:
-        from rembg import remove
-        from PIL import Image
-        import io as _io
+        response = requests.post(
+            "https://api.remove.bg/v1.0/removebg",
+            files={"image_file": ("image.jpg", raw_bytes, "image/jpeg")},
+            data={"size": "auto"},
+            headers={"X-Api-Key": api_key},
+            timeout=30,
+        )
 
-        img = Image.open(_io.BytesIO(raw_bytes)).convert("RGB")
-        max_dim = 1000
-        if max(img.size) > max_dim:
-            ratio = max_dim / max(img.size)
-            new_size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
-            img = img.resize(new_size, Image.LANCZOS)
-            buf = _io.BytesIO()
-            img.save(buf, format="PNG")
-            raw_bytes = buf.getvalue()
+        if response.status_code == 200:
+            log("[BG_REMOVE_OK] remove.bg نجحت")
+            return response.content  # PNG شفاف جاهز
+        else:
+            log(f"[BG_REMOVE_API_ERR] status={response.status_code} body={response.text[:200]}")
+            return raw_bytes
 
-        session = _get_rembg_session()
-        result = remove(raw_bytes, session=session)
-        log("[BG_REMOVE_OK]")
-        return result
-    except ImportError:
-        log("[BG_REMOVE_SKIP] مكتبة rembg غير مثبتة — تأكد من وجودها في requirements.txt")
+    except requests.exceptions.Timeout:
+        log("[BG_REMOVE_TIMEOUT] انتهت مهلة remove.bg API")
         return raw_bytes
     except Exception as e:
         log(f"[BG_REMOVE_ERR] {e}")
