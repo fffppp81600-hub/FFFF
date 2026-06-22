@@ -58,6 +58,24 @@ def save_uploaded_image(project_name: str, filename: str, raw_bytes: bytes, mime
 
 
 def remove_background(raw_bytes: bytes) -> bytes:
+    try:
+        from rembg import remove, new_session
+
+        global RMBG_SESSION
+
+        try:
+            RMBG_SESSION
+        except NameError:
+            RMBG_SESSION = new_session("u2netp")
+
+        result = remove(raw_bytes, session=RMBG_SESSION)
+
+        log("[BG_REMOVE_OK]")
+        return result
+
+    except Exception as e:
+        log(f"[BG_REMOVE_ERR] {e}")
+        return raw_bytes
     """
     يزيل خلفية صورة باستخدام rembg، ويرجع bytes الصورة الناتجة (PNG شفاف).
     يستخدم نموذج u2netp الخفيف (~5MB) بدل الافتراضي الثقيل u2net — أسرع وأنسب
