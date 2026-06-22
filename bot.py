@@ -562,10 +562,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     raw = f.read()
 
                 try:
-                    # ✅ رفعنا الـ timeout إلى 180 ثانية — rembg بدون GPU تحتاج وقت أطول
+                    # ✅ 35 ثانية كافية لـ remove.bg API
                     processed = await asyncio.wait_for(
                         asyncio.to_thread(remove_background, raw),
-                        timeout=180,
+                        timeout=35,
                     )
                     new_filename = os.path.basename(saved["path"]).rsplit(".", 1)[0] + "_nobg.png"
                     new_path = os.path.join(UPLOADS_DIR, new_filename)
