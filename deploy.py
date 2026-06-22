@@ -1,140 +1,102 @@
 """
-store.py — قاعدة بيانات SQLite محلية دائمة.
-تخزن: المشاريع وملفاتها + الصور المرفوعة (base64) — يُسترجَع كل شيء تلقائياً
-على القرص بعد كل إعادة تشغيل عبر restore_all_sites_from_db() في deploy.py.
+deploy.py — نشر المواقع محلياً على القرص + استرجاعها من Turso بعد كل إعادة تشغيل.
+يشمل أيضاً: حفظ الصور المرفوعة + دالة اختيارية لإزالة خلفية الصور (rembg).
 """
 import os
-import sqlite3
-import json
-from contextlib import contextmanager
+import shutil
+import base64
+import io
+from logger import log
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "data.db")
+SITES_DIR = os.path.join(os.path.dirname(__file__), "sites")
+os.makedirs(SITES_DIR, exist_ok=True)
+
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 
 
-@contextmanager
-def _conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+def _write_to_disk(name: str, files: list):
+    project_dir = os.path.join(SITES_DIR, name)
+    os.makedirs(project_dir, exist_ok=True)
+    for f in files:
+        path = os.path.join(project_dir, f["path"])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fp:
+            fp.write(f["content"])
+
+
+def deploy_project(name: str, files: list) -> str:
+    if not BASE_URL:
+        raise Exception("BASE_URL غير محدد في متغيرات البيئة!")
+    _write_to_disk(name, files)
+    url = f"{BASE_URL}/s/{name}/"
+    log(f"[DEPLOY_LOCAL] project={name} url={url}")
+    return url
+
+
+def delete_vercel_project(name: str):
+    project_dir = os.path.join(SITES_DIR, name)
+    if os.path.exists(project_dir):
+        shutil.rmtree(project_dir)
+        log(f"[DELETE_LOCAL] project={name}")
+
+
+def save_uploaded_image(project_name: str, filename: str, raw_bytes: bytes, mime: str = "image/jpeg") -> str:
+    """يحفظ الصورة على القرص + Turso (دائمة)، ويرجع رابطها العام."""
+    from store import save_image
+
+    uploads_dir = os.path.join(SITES_DIR, project_name, "uploads")
+    os.makedirs(uploads_dir, exist_ok=True)
+    local_path = os.path.join(uploads_dir, filename)
+    with open(local_path, "wb") as fp:
+        fp.write(raw_bytes)
+
+    b64 = base64.b64encode(raw_bytes).decode("utf-8")
+    save_image(project_name, filename, b64, mime)
+
+    log(f"[IMAGE_SAVED] project={project_name} file={filename}")
+    return f"{BASE_URL}/s/{project_name}/uploads/{filename}"
+
+
+def remove_background(raw_bytes: bytes) -> bytes:
+    """
+    يزيل خلفية صورة باستخدام rembg، ويرجع bytes الصورة الناتجة (PNG شفاف).
+    لو rembg غير مثبتة أو فشلت لأي سبب، يرجع الصورة الأصلية بدون تعديل (fail-safe).
+    """
     try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+        from rembg import remove
+        result = remove(raw_bytes)
+        log("[BG_REMOVE_OK]")
+        return result
+    except ImportError:
+        log("[BG_REMOVE_SKIP] مكتبة rembg غير مثبتة — تأكد من وجودها في requirements.txt")
+        return raw_bytes
+    except Exception as e:
+        log(f"[BG_REMOVE_ERR] {e}")
+        return raw_bytes
 
 
-def init_db():
-    with _conn() as c:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS projects (
-                user_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                url TEXT NOT NULL,
-                files TEXT NOT NULL,
-                display_name TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user_id, name)
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS images (
-                project_name TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                b64_data TEXT NOT NULL,
-                mime TEXT DEFAULT 'image/jpeg',
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (project_name, filename)
-            )
-        """)
+def restore_all_sites_from_db():
+    """
+    يُستدعى عند بدء تشغيل السيرفر: يعيد كتابة كل المواقع والصور المحفوظة
+    بقاعدة بيانات Turso إلى القرص المحلي (Render يمسح القرص عند كل إعادة تشغيل).
+    """
+    from store import get_all_projects, get_all_images
+
+    projects = get_all_projects()
+    for p in projects:
+        if p["files"]:
+            _write_to_disk(p["name"], p["files"])
+    log(f"[RESTORE_SITES] استرجاع {len(projects)} مشروع")
+
+    images = get_all_images()
+    for img in images:
+        uploads_dir = os.path.join(SITES_DIR, img["project_name"], "uploads")
+        os.makedirs(uploads_dir, exist_ok=True)
+        local_path = os.path.join(uploads_dir, img["filename"])
         try:
-            c.execute("ALTER TABLE projects ADD COLUMN display_name TEXT")
-        except sqlite3.OperationalError:
-            pass  # العمود موجود فعلاً
-
-
-init_db()
-
-
-def add_project(user_id: str, name: str, url: str, files: list = None):
-    with _conn() as c:
-        c.execute(
-            "INSERT OR REPLACE INTO projects (user_id, name, url, files) VALUES (?, ?, ?, ?)",
-            (str(user_id), name, url, json.dumps(files or []))
-        )
-
-
-def get_projects(user_id: str) -> list:
-    with _conn() as c:
-        rows = c.execute(
-            "SELECT name, url, display_name FROM projects WHERE user_id = ? ORDER BY created_at DESC",
-            (str(user_id),)
-        ).fetchall()
-        return [
-            {"name": r["name"], "url": r["url"], "display_name": r["display_name"] or r["name"]}
-            for r in rows
-        ]
-
-
-def rename_project(user_id: str, name: str, new_display_name: str) -> bool:
-    """يغيّر الاسم التعريفي فقط — لا يؤثر على رابط الموقع الفعلي."""
-    with _conn() as c:
-        cur = c.execute(
-            "UPDATE projects SET display_name = ? WHERE user_id = ? AND name = ?",
-            (new_display_name.strip(), str(user_id), name)
-        )
-        return cur.rowcount > 0
-
-
-def get_project_files_db(user_id: str, name: str) -> list:
-    with _conn() as c:
-        row = c.execute(
-            "SELECT files FROM projects WHERE user_id = ? AND name = ?",
-            (str(user_id), name)
-        ).fetchone()
-        return json.loads(row["files"]) if row else []
-
-
-def delete_project(user_id: str, name: str):
-    with _conn() as c:
-        c.execute("DELETE FROM projects WHERE user_id = ? AND name = ?", (str(user_id), name))
-        c.execute("DELETE FROM images WHERE project_name = ?", (name,))
-
-
-def get_all_projects() -> list:
-    with _conn() as c:
-        rows = c.execute("SELECT user_id, name, url, files FROM projects").fetchall()
-        return [
-            {"user_id": r["user_id"], "name": r["name"], "url": r["url"], "files": json.loads(r["files"])}
-            for r in rows
-        ]
-
-
-def project_exists(user_id: str, name: str) -> bool:
-    with _conn() as c:
-        row = c.execute(
-            "SELECT 1 FROM projects WHERE user_id = ? AND name = ?",
-            (str(user_id), name)
-        ).fetchone()
-        return row is not None
-
-
-def save_image(project_name: str, filename: str, b64_data: str, mime: str = "image/jpeg"):
-    with _conn() as c:
-        c.execute(
-            "INSERT OR REPLACE INTO images (project_name, filename, b64_data, mime) VALUES (?, ?, ?, ?)",
-            (project_name, filename, b64_data, mime)
-        )
-
-
-def get_image(project_name: str, filename: str):
-    with _conn() as c:
-        row = c.execute(
-            "SELECT b64_data, mime FROM images WHERE project_name = ? AND filename = ?",
-            (project_name, filename)
-        ).fetchone()
-        return (row["b64_data"], row["mime"]) if row else None
-
-
-def get_all_images() -> list:
-    with _conn() as c:
-        rows = c.execute("SELECT project_name, filename, b64_data, mime FROM images").fetchall()
-        return [dict(r) for r in rows]
+            raw = base64.b64decode(img["b64_data"])
+            with open(local_path, "wb") as fp:
+                fp.write(raw)
+        except Exception as e:
+            log(f"[RESTORE_IMAGE_ERR] {img['filename']} err={e}")
+    log(f"[RESTORE_IMAGES] استرجاع {len(images)} صورة")
