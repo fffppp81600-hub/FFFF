@@ -546,7 +546,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     # عن كل المستخدمين، وبحد أقصى 40 ثانية تفادياً لتعليق دائم.
                     processed = await asyncio.wait_for(
                         asyncio.to_thread(remove_background, raw),
-                        timeout=180,
+                        timeout=70,
                     )
                     # نحفظ النسخة المعدّلة فوق نفس الملف (PNG شفاف) ونحدّث الرابط بامتداد جديد
                     new_filename = os.path.basename(saved["path"]).rsplit(".", 1)[0] + "_nobg.png"
