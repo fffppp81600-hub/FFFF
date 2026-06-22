@@ -31,7 +31,7 @@ _cooldown: dict  = {}
 EDIT_MODE: dict  = {}
 USER_STATS: dict = {}
 PENDING_IMAGE: dict = {}
-PENDING_BUILD: dict = {}  # uid -> {"data": dict, "is_edit": bool, "proj": str|None}
+PENDING_BUILD: dict = {}  # uid -> {"data": dict, "is_edit": bool, "proj": str|None, "preview_name": str}
 PLANNING: dict = {}       # uid -> [{"role": "user"/"assistant", "content": "..."}] محادثة تخطيط قبل البناء
 LAST_VERSION: dict = {}   # proj_name -> {"files": [...], "url": str} — نسخة سابقة واحدة لكل مشروع (للرجوع/undo)
 RENAME_MODE: dict = {}    # uid -> proj_name — بانتظار إرسال الاسم الجديد التعريفي
@@ -40,7 +40,6 @@ SITES_DIR = os.path.join(os.path.dirname(__file__), "sites")
 UPLOADS_DIR = os.path.join(SITES_DIR, "_uploads")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-# نفس متغير BASE_URL المستخدم في deploy.py — لازم يكون مضبوط بـ Render
 PUBLIC_BASE = os.getenv("BASE_URL", "").rstrip("/")
 
 
@@ -230,7 +229,6 @@ async def _do_edit(update: Update, uid: str, text: str, proj: str,
     if local:
         for f in local:
             current += f"\n--- {f['path']} ---\n{f['content']}\n"
-        # نحفظ نسخة الموقع الحالية قبل التعديل — تُستخدم بزر "↩️ رجوع" لو ما عجب التعديل الجديد
         LAST_VERSION[proj] = {"files": local}
     else:
         await update.message.reply_text("⚠️ لم أجد الملفات، سيُعامَل كمشروع جديد.")
@@ -256,23 +254,29 @@ async def _do_edit(update: Update, uid: str, text: str, proj: str,
 
 async def _do_preview(update: Update, uid: str, data: dict, is_edit: bool, original_proj: Optional[str] = None):
     """
-    ينشر الموقع تحت اسم معاينة مؤقت ويعرضه فعلياً قابل للفتح، بدل النشر المباشر بالاسم النهائي.
-    يخزن الـ data بانتظار قرار المستخدم: نشر نهائي (يثبّت بالاسم الحقيقي) أو تعديل (يرجع لوضع التعديل).
+    ينشر الموقع تحت اسم معاينة مؤقت ويعرضه فعلياً قابل للفتح.
+    يخزن data + preview_name بانتظار قرار المستخدم.
     """
     await _typing(update)
     await update.message.reply_text("📦 جاري تحضير معاينة موقعك...")
     try:
-        preview_name = data["projectName"] if is_edit else f"preview-{data['projectName']}-{int(time.time()) % 10000}"
+        preview_name = (
+            data["projectName"]
+            if is_edit
+            else f"preview-{data['projectName']}-{int(time.time()) % 10000}"
+        )
         preview_data = {**data, "projectName": preview_name}
 
         build_project(preview_data, uid)
         preview_url = deploy_project(preview_name, preview_data.get("files", []))
 
+        # ✅ نحفظ preview_name و preview_files عشان confirm_publish يستخدمهم مباشرة
         PENDING_BUILD[uid] = {
             "data": data,
             "is_edit": is_edit,
             "proj": original_proj,
             "preview_name": preview_name,
+            "preview_files": preview_data.get("files", []),
         }
 
         buttons = [
@@ -280,7 +284,6 @@ async def _do_preview(update: Update, uid: str, data: dict, is_edit: bool, origi
             [InlineKeyboardButton("✅ نشر الموقع", callback_data="confirm_publish"),
              InlineKeyboardButton("✏️ تعديل أكثر", callback_data="continue_edit")],
         ]
-        # زر الرجوع يظهر فقط لو فيه نسخة سابقة محفوظة لهذا المشروع بالذات (يعني هذا تعديل، مو بناء أول مرة)
         if original_proj and original_proj in LAST_VERSION:
             buttons.append([InlineKeyboardButton("↩️ رجوع للنسخة السابقة", callback_data="undo_edit")])
 
@@ -297,7 +300,7 @@ async def _do_preview(update: Update, uid: str, data: dict, is_edit: bool, origi
 
 
 async def _do_deploy(update: Update, uid: str, data: dict):
-    """نشر نهائي مباشر بالاسم الحقيقي (يُستخدم بعد تأكيد المعاينة، أو يفضل استخدام _do_preview قبله)."""
+    """نشر نهائي مباشر بالاسم الحقيقي."""
     await _typing(update)
     await update.message.reply_text("📦 رفع الملفات...")
     try:
@@ -342,8 +345,7 @@ class _FakeUpdate:
 
 async def _continue_photo_flow(update, uid: str, saved: dict, caption: str):
     """
-    يكمل معالجة الصورة بعد تحديد قرار إزالة الخلفية (سواء طُبّقت أو تم تجاوزها).
-    update: يجب أن يحتوي .message.reply_text (Update عادي، أو _FakeUpdate من CallbackQuery).
+    يكمل معالجة الصورة بعد تحديد قرار إزالة الخلفية.
     """
     if uid in EDIT_MODE:
         if caption:
@@ -445,6 +447,18 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⏳ انتظر {remaining} ثانية بين الطلبات.")
             return
 
+        # ── وضع تعديل الاسم ─────────────────────
+        if uid in RENAME_MODE:
+            proj = RENAME_MODE.pop(uid)
+            new_name = text.strip()
+            try:
+                rename_project(uid, proj, new_name)
+                await update.message.reply_text(f"✅ تم تغيير الاسم إلى: {new_name}")
+            except Exception as e:
+                log(f"[RENAME_ERR] uid={uid} proj={proj} err={e}")
+                await update.message.reply_text("❌ فشل تغيير الاسم، حاول مرة أخرى.")
+            return
+
         if uid in EDIT_MODE:
             proj = EDIT_MODE.pop(uid)
             pending = PENDING_IMAGE.pop(uid, None)
@@ -459,7 +473,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ── محادثة تخطيط قبل البناء ──────────────
-        # نتراكم رسائل المستخدم بهذا السياق إلى أن يقرر AI نفسه إنه فهم وجاهز للبناء
         history = PLANNING.setdefault(uid, [])
 
         pending_img = PENDING_IMAGE.pop(uid, None)
@@ -483,7 +496,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(reply_text)
             return
 
-        # المستخدم جاهز — نبني فعلياً من كامل المحادثة المتراكمة
         await update.message.reply_text(reply_text)
         data = await _do_build_from_conversation(update, uid, history)
         PLANNING.pop(uid, None)
@@ -506,27 +518,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     uid = str(q.from_user.id)
 
-    # ── أزرار المعاينة (بلا |) ──────────────────
+    # ── confirm_publish ──────────────────────────
     if q.data == "confirm_publish":
         pending = PENDING_BUILD.pop(uid, None)
         if not pending:
             await q.message.reply_text("⚠️ لا توجد معاينة بانتظار النشر. أرسل طلب جديد.")
             return
         try:
-            data = pending["data"]
-            build_project(data, uid)
-            url = deploy_project(data["projectName"], data.get("files", []))
-            add_project(uid, data["projectName"], url, data.get("files", []))
-            log(f"[PUBLISH_OK] uid={uid} proj={data['projectName']} url={url}")
+            data        = pending["data"]
+            final_name  = data["projectName"]
+            # ✅ الملفات الصحيحة: نأخذها من preview_files (هي المبنية فعلاً)
+            final_files = pending.get("preview_files") or data.get("files", [])
+
+            # نحدّث الـ data باسم نهائي ثابت وملفاته الصحيحة
+            final_data = {**data, "projectName": final_name, "files": final_files}
+
+            build_project(final_data, uid)
+            url = deploy_project(final_name, final_files)
+            add_project(uid, final_name, url, final_files)
+            log(f"[PUBLISH_OK] uid={uid} proj={final_name} url={url}")
             await q.message.reply_text(
-                f"✅ تم النشر النهائي!\n\n📛 الاسم: {data['projectName']}\n🔗 {url}\n\nاستخدم الأزرار 👇",
-                reply_markup=_project_keyboard(data["projectName"], url),
+                f"✅ تم النشر النهائي!\n\n📛 الاسم: {final_name}\n🔗 {url}\n\nاستخدم الأزرار 👇",
+                reply_markup=_project_keyboard(final_name, url),
             )
         except Exception as e:
             log(f"[PUBLISH_ERR] uid={uid} err={e}")
             await q.message.reply_text("❌ فشل النشر النهائي. حاول مرة أخرى.")
         return
 
+    # ── rmbg ────────────────────────────────────
     if q.data in ("rmbg_yes", "rmbg_no"):
         saved = PENDING_IMAGE.get(uid)
         if not saved:
@@ -542,13 +562,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     raw = f.read()
 
                 try:
-                    # تشغيل rembg (ثقيلة ومتزامنة) بثريد منفصل عشان ما يجمّد حلقة البوت بالكامل
-                    # عن كل المستخدمين، وبحد أقصى 40 ثانية تفادياً لتعليق دائم.
+                    # ✅ رفعنا الـ timeout إلى 180 ثانية — rembg بدون GPU تحتاج وقت أطول
                     processed = await asyncio.wait_for(
                         asyncio.to_thread(remove_background, raw),
-                        timeout=70,
+                        timeout=180,
                     )
-                    # نحفظ النسخة المعدّلة فوق نفس الملف (PNG شفاف) ونحدّث الرابط بامتداد جديد
                     new_filename = os.path.basename(saved["path"]).rsplit(".", 1)[0] + "_nobg.png"
                     new_path = os.path.join(UPLOADS_DIR, new_filename)
                     with open(new_path, "wb") as f:
@@ -559,22 +577,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await q.message.reply_text("✅ تمت إزالة الخلفية بنجاح.")
                 except asyncio.TimeoutError:
                     log(f"[RMBG_TIMEOUT] uid={uid}")
-                    await q.message.reply_text("⚠️ استغرقت إزالة الخلفية وقتاً طويلاً، استخدمنا الصورة الأصلية.")
+                    # ✅ بدل ما نتجاهل الطلب، نكمل بالصورة الأصلية بدون إيقاف التدفق
+                    await q.message.reply_text("⏱ إزالة الخلفية تأخرت، سنكمل بالصورة الأصلية تلقائياً.")
             except Exception as e:
                 log(f"[RMBG_CALLBACK_ERR] uid={uid} err={e}")
                 await q.message.reply_text("⚠️ تعذّرت إزالة الخلفية، سنستخدم الصورة الأصلية.")
         else:
             await q.message.reply_text("➡️ تم تجاوز إزالة الخلفية.")
 
+        # ✅ في جميع الحالات (نجاح / timeout / خطأ) نكمل التدفق
         await _continue_photo_flow(_FakeUpdate(q.message), uid, saved, caption)
         return
 
+    # ── continue_edit ────────────────────────────
     if q.data == "continue_edit":
         pending = PENDING_BUILD.get(uid)
         if not pending:
             await q.message.reply_text("⚠️ لا توجد معاينة حالية للتعديل عليها. أرسل طلب جديد.")
             return
-        # نفتح وضع تعديل على نفس مشروع المعاينة المؤقت (preview_name) — التعديل القادم يبني فوقه
         EDIT_MODE[uid] = pending["preview_name"]
         await q.message.reply_text(
             "✏️ تمام، أرسل الآن التغييرات التي تريدها على المعاينة.\n"
@@ -582,6 +602,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ── undo_edit ────────────────────────────────
     if q.data == "undo_edit":
         pending = PENDING_BUILD.get(uid)
         if not pending or not pending.get("proj"):
