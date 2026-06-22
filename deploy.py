@@ -57,34 +57,43 @@ def save_uploaded_image(project_name: str, filename: str, raw_bytes: bytes, mime
     return f"{BASE_URL}/s/{project_name}/uploads/{filename}"
 
 
+_rembg_session = None
+
+
+def _get_rembg_session():
+    """يحمّل موديل rembg مرة واحدة فقط طوال عمر العملية، بدل تحميله من جديد كل طلب."""
+    global _rembg_session
+    if _rembg_session is None:
+        from rembg import new_session
+        _rembg_session = new_session("u2netp")
+    return _rembg_session
+
+
 def remove_background(raw_bytes: bytes) -> bytes:
-    try:
-        from rembg import remove, new_session
-
-        global RMBG_SESSION
-
-        try:
-            RMBG_SESSION
-        except NameError:
-            RMBG_SESSION = new_session("u2netp")
-
-        result = remove(raw_bytes, session=RMBG_SESSION)
-
-        log("[BG_REMOVE_OK]")
-        return result
-
-    except Exception as e:
-        log(f"[BG_REMOVE_ERR] {e}")
-        return raw_bytes
     """
     يزيل خلفية صورة باستخدام rembg، ويرجع bytes الصورة الناتجة (PNG شفاف).
-    يستخدم نموذج u2netp الخفيف (~5MB) بدل الافتراضي الثقيل u2net — أسرع وأنسب
-    لموارد Render المجانية (ذاكرة ومعالج محدودين)، ويقلل احتمال التجمد/البطء الشديد.
+    تحسينات للسرعة على معالج Render المجاني الضعيف:
+    - يصغّر الصورة لأقصى بعد 1000px قبل المعالجة (صور الجوالات تكون أحياناً 3000px+،
+      وحجم الصورة يؤثر بشكل كبير على وقت الاستنتاج).
+    - يعيد استخدام نفس جلسة الموديل المحمّلة مسبقاً بدل تحميلها من جديد كل مرة.
     لو rembg غير مثبتة أو فشلت لأي سبب، يرجع الصورة الأصلية بدون تعديل (fail-safe).
     """
     try:
-        from rembg import remove, new_session
-        session = new_session("u2netp")
+        from rembg import remove
+        from PIL import Image
+        import io as _io
+
+        img = Image.open(_io.BytesIO(raw_bytes)).convert("RGB")
+        max_dim = 1000
+        if max(img.size) > max_dim:
+            ratio = max_dim / max(img.size)
+            new_size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
+            img = img.resize(new_size, Image.LANCZOS)
+            buf = _io.BytesIO()
+            img.save(buf, format="PNG")
+            raw_bytes = buf.getvalue()
+
+        session = _get_rembg_session()
         result = remove(raw_bytes, session=session)
         log("[BG_REMOVE_OK]")
         return result
