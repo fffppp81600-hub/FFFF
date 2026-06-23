@@ -1,12 +1,11 @@
 """
-builder.py — يكتب ملفات مشروع جديد/معدّل على القرص (projects/<uid>/<projectName>/).
+builder.py — كتابة ملفات المشروع على القرص — النسخة المطورة.
 
-ميزات:
-  - فحص بنية data القادمة من AI قبل الكتابة (تجنّب كتابة ملفات فاسدة لو فشل validator سابقاً)
-  - حماية من path traversal في أسماء الملفات القادمة من AI (دفاع إضافي حتى لو AI أخطأ)
-  - كتابة "atomic" بسيطة: نكتب لملف مؤقت أولاً، وبعد نجاح الكتابة الكاملة نستبدل الملف الأصلي،
-    لتجنب ترك ملف نصفه مكتوب لو حدث انقطاع أثناء الكتابة
-  - إرجاع True/False بدل الفشل الصامت، عشان bot.py يقدر يتعامل مع الخطأ بوضوح
+التحسينات:
+  - دعم projectType في البيانات
+  - كتابة ذرية (atomic write) لمنع تلف الملفات
+  - حماية كاملة من path traversal
+  - تسجيل تفصيلي
 """
 import os
 from logger import log
@@ -17,37 +16,38 @@ os.makedirs(BASE_DIR, exist_ok=True)
 REQUIRED_FILES = {"index.html", "style.css", "script.js"}
 
 
-def _is_safe_relative_path(path: str) -> bool:
-    """يرفض أي مسار يحاول الخروج عن مجلد المشروع (../ أو مسار مطلق)."""
+def _is_safe_path(path: str) -> bool:
+    """يرفض أي مسار يحاول الخروج عن مجلد المشروع."""
     if not path or path.startswith("/") or path.startswith("\\"):
         return False
     normalized = os.path.normpath(path)
-    if normalized.startswith("..") or os.path.isabs(normalized):
-        return False
-    return True
+    return not (normalized.startswith("..") or os.path.isabs(normalized))
 
 
 def _atomic_write(path: str, content: str) -> None:
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
+    """كتابة ذرية — يضمن عدم ترك ملف نصفه مكتوب."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         f.write(content)
-    os.replace(tmp_path, path)  # عملية ذرية على أغلب أنظمة الملفات
+    os.replace(tmp, path)
 
 
 def build_project(data: dict, user_id: str) -> bool:
     """
-    يكتب كل ملفات data["files"] داخل projects/<user_id>/<data['projectName']>/.
-    يرجع True عند نجاح كتابة كل الملفات المطلوبة، False لو فيه خلل بالبيانات نفسها.
+    يكتب كل ملفات المشروع على القرص.
+    يدعم projectType في البيانات.
+    يرجع True عند نجاح الكتابة، False عند فشل.
     """
     if not isinstance(data, dict):
         log(f"[BUILDER_ERR] user={user_id} data ليست dict")
         return False
 
     project_name = data.get("projectName")
-    files = data.get("files", [])
+    files        = data.get("files", [])
+    project_type = data.get("projectType", "website")
 
     if not project_name or not isinstance(files, list) or not files:
-        log(f"[BUILDER_ERR] user={user_id} بيانات مشروع غير مكتملة: name={project_name} files_count={len(files) if isinstance(files, list) else 'N/A'}")
+        log(f"[BUILDER_ERR] user={user_id} بيانات ناقصة: name={project_name}")
         return False
 
     found_paths = {f.get("path") for f in files if isinstance(f, dict)}
@@ -59,13 +59,21 @@ def build_project(data: dict, user_id: str) -> bool:
     base = os.path.join(BASE_DIR, str(user_id), project_name)
     os.makedirs(base, exist_ok=True)
 
+    # حفظ معلومات المشروع
+    meta_path = os.path.join(base, ".meta")
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            f.write(f"type={project_type}\nname={project_name}\n")
+    except OSError:
+        pass
+
     written = 0
     for f in files:
         rel_path = f.get("path", "")
-        content = f.get("content", "")
+        content  = f.get("content", "")
 
-        if not _is_safe_relative_path(rel_path):
-            log(f"[BUILDER_SKIP_UNSAFE] user={user_id} proj={project_name} path={rel_path}")
+        if not _is_safe_path(rel_path):
+            log(f"[BUILDER_SKIP] user={user_id} unsafe path={rel_path}")
             continue
 
         full_path = os.path.join(base, rel_path)
@@ -75,8 +83,9 @@ def build_project(data: dict, user_id: str) -> bool:
             _atomic_write(full_path, content)
             written += 1
         except OSError as e:
-            log(f"[BUILDER_WRITE_ERR] user={user_id} proj={project_name} path={rel_path} err={e}")
+            log(f"[BUILDER_WRITE_ERR] user={user_id} path={rel_path} err={e}")
 
-    log(f"[BUILDER_OK] user={user_id} proj={project_name} written={written}/{len(files)}")
-    return written >= len(REQUIRED_FILES)
-  
+    success = written >= len(REQUIRED_FILES)
+    log(f"[BUILDER_{'OK' if success else 'FAIL'}] user={user_id} proj={project_name} "
+        f"type={project_type} written={written}/{len(files)}")
+    return success
