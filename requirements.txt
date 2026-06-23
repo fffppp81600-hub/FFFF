@@ -26,4 +26,4 @@ requests==2.32.3
 # tavily-python==0.3.3   (اختياري - نستخدم requests مباشرة)
 
 # ── Utilities ─────────────────────────────────
-pydantic==2.8.2
+pydantic==2.10.6
