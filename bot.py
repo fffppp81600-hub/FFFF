@@ -1,6 +1,13 @@
 """
-bot.py — Telegram bot — يحفظ المشاريع بشكل دائم في قاعدة بيانات.
-مضمون الرد دائماً على أي صورة أو رسالة (try/except شامل في كل هاندلر).
+bot.py — بوت تيليجرام — النسخة المطورة.
+
+المميزات الجديدة:
+  - Version Control كامل (حفظ + استرجاع أي نسخة)
+  - دعم ألعاب كاملة
+  - ذاكرة دائمة بين الجلسات
+  - إحصائيات مفصلة من DB
+  - واجهة أزرار محسّنة
+  - معالجة شاملة للأخطاء
 """
 import os
 import time
@@ -17,46 +24,63 @@ from telegram.ext import (
 )
 from telegram.constants import ChatAction
 
-from ai import builder, editor, plan_chat, build_from_conversation
+from ai import builder, editor, plan_chat, build_from_conversation, game_builder, _detect_project_type
 from builder import build_project
 from deploy import deploy_project, delete_vercel_project, remove_background
 from validator import safe_parse
-from store import add_project, get_projects, delete_project, get_project_files_db, rename_project
+from store import (
+    add_project, get_projects, delete_project, get_project_files_db,
+    rename_project, save_version, get_versions, get_version_files,
+    update_project_files, upsert_user, increment_user_stat, get_user_stats,
+    save_asset, get_project_assets
+)
 from file_manager import delete_project_files, get_project_files
+import memory as mem
 from logger import log
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-_cooldown: dict  = {}
-EDIT_MODE: dict  = {}
-USER_STATS: dict = {}
-PENDING_IMAGE: dict = {}
-PENDING_BUILD: dict = {}  # uid -> {"data": dict, "is_edit": bool, "proj": str|None, "preview_name": str}
-PLANNING: dict = {}       # uid -> [{"role": "user"/"assistant", "content": "..."}] محادثة تخطيط قبل البناء
-LAST_VERSION: dict = {}   # proj_name -> {"files": [...], "url": str} — نسخة سابقة واحدة لكل مشروع (للرجوع/undo)
-RENAME_MODE: dict = {}    # uid -> proj_name — بانتظار إرسال الاسم الجديد التعريفي
+# ─── حالات المستخدم ───────────────────────────
+_cooldown:     dict = {}
+EDIT_MODE:     dict = {}   # uid -> proj_name
+PLANNING:      dict = {}   # uid -> [conversation history]
+PENDING_IMAGE: dict = {}   # uid -> {path, url, caption}
+PENDING_BUILD: dict = {}   # uid -> {data, is_edit, proj, preview_name, preview_files}
+RENAME_MODE:   dict = {}   # uid -> proj_name
+VERSION_MODE:  dict = {}   # uid -> proj_name (لعرض قائمة الإصدارات)
 
-SITES_DIR = os.path.join(os.path.dirname(__file__), "sites")
+SITES_DIR   = os.path.join(os.path.dirname(__file__), "sites")
 UPLOADS_DIR = os.path.join(SITES_DIR, "_uploads")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 PUBLIC_BASE = os.getenv("BASE_URL", "").rstrip("/")
+MAX_PROJECTS_PER_USER = int(os.getenv("MAX_PROJECTS", "20"))
 
 
-def _allow(uid: str, seconds: int = 8):
+# ─── Helpers ──────────────────────────────────
+def _allow(uid: str, seconds: int = 8) -> tuple[bool, int]:
     now = time.time()
-    if now - _cooldown.get(uid, 0) < seconds:
-        remaining = int(seconds - (now - _cooldown.get(uid, 0)))
-        return False, remaining
+    last = _cooldown.get(uid, 0)
+    if now - last < seconds:
+        return False, int(seconds - (now - last))
     _cooldown[uid] = now
     return True, 0
 
 
-def _track(uid: str, action: str):
-    s = USER_STATS.setdefault(uid, {"builds": 0, "edits": 0, "images": 0, "last_active": ""})
-    if action in s:
-        s[action] += 1
-    s["last_active"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+def _type_emoji(ptype: str) -> str:
+    return {"game": "🎮", "store": "🛍️", "dashboard": "📊",
+            "landing": "🚀", "portfolio": "💼", "app": "📱"}.get(ptype, "🌐")
+
+
+def _project_keyboard(proj_name: str, url: str, ptype: str = "website") -> InlineKeyboardMarkup:
+    emoji = _type_emoji(ptype)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{emoji} افتح المشروع", url=url),
+         InlineKeyboardButton("✏️ تعديل", callback_data=f"edit|{proj_name}")],
+        [InlineKeyboardButton("📋 الإصدارات", callback_data=f"versions|{proj_name}"),
+         InlineKeyboardButton("📝 تعديل الاسم", callback_data=f"rename|{proj_name}")],
+        [InlineKeyboardButton("🗑 حذف", callback_data=f"del|{proj_name}")],
+    ])
 
 
 async def _typing(update: Update):
@@ -89,6 +113,7 @@ def _fallback(text: str, uid: str) -> dict:
 </body></html>"""
     return {
         "projectName": name,
+        "projectType": "website",
         "files": [
             {"path": "index.html", "content": html},
             {"path": "style.css",  "content": "body{font-family:'Cairo',sans-serif}"},
@@ -97,40 +122,52 @@ def _fallback(text: str, uid: str) -> dict:
     }
 
 
-def _project_keyboard(proj_name: str, url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌐 افتح الموقع", url=url),
-         InlineKeyboardButton("✏️ تعديل", callback_data=f"edit|{proj_name}")],
-        [InlineKeyboardButton("📝 تعديل الاسم", callback_data=f"rename|{proj_name}"),
-         InlineKeyboardButton("🗑 حذف", callback_data=f"del|{proj_name}")],
-    ])
-
-
+# ─── Commands ─────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.from_user.first_name or "صديقي"
+    uid  = str(update.message.from_user.id)
+    user = update.message.from_user
+    upsert_user(uid, user.username or "", user.first_name or "")
+    name = user.first_name or "صديقي"
     await update.message.reply_text(
         f"👋 أهلاً {name}!\n\n"
-        "أنا بوت بناء المواقع بالذكاء الاصطناعي 🤖\n\n"
-        "📌 احكِ لي عن فكرتك بشكل طبيعي، وأنا أرد وأسأل عن أي تفصيل ناقص.\n"
-        "✅ لما تكون جاهز (تقول مثلاً: يلا ابدأ)، أبني الموقع فعلياً وأعرض لك معاينة حقيقية قبل النشر.\n"
-        "🔎 لو طلبت روابط حقيقية (فيديوهات، مواقع)، أبحث فعلياً بالإنترنت وأضمّنها بالموقع.\n"
-        "📷 تقدر ترسل صورة (لوقو/منتج) مع وصفها في أي وقت.\n\n"
-        "/help — شرح مفصل\n/my — مشاريعك\n/stats — إحصائياتك\n/cancel — إلغاء أي محادثة جارية"
+        "🤖 أنا منصة بناء المواقع والألعاب والتطبيقات بالذكاء الاصطناعي\n\n"
+        "📌 كيف تستخدمني:\n"
+        "  • اكتب فكرتك بشكل طبيعي وأنا أسألك عن أي تفصيل\n"
+        "  • لما تقول 'يلا ابدأ' أبني المشروع فعلاً\n"
+        "  • شوف معاينة حقيقية قبل النشر النهائي\n"
+        "  • عدّل بعد النشر بكل سهولة\n\n"
+        "🎮 تريد لعبة؟ قل مثلاً: 'سوّي لي لعبة Sudoku'\n"
+        "🛍️ متجر؟ 'ابني متجر إلكترونيات'\n"
+        "🌐 موقع؟ 'أنشئ موقع بورتفوليو'\n\n"
+        "/help — شرح مفصل\n"
+        "/my — مشاريعك\n"
+        "/stats — إحصائياتك\n"
+        "/cancel — إلغاء أي عملية"
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 دليل الاستخدام\n\n"
-        "🏗 بناء موقع جديد: احكِ لي عن فكرتك بشكل طبيعي، حتى لو على دفعات.\n"
-        "أنا أرد عليك وأسألك عن أي تفصيل ناقص، ولا أبدأ البناء إلا لما أحس إنك جاهز "
-        "(مثل ما تقول: يلا ابدأ / سويها / تمام جاهز).\n"
-        "كل ما تقوله يُلتزم به بالضبط — لا أخترع أقسام أو منتجات من عندي.\n\n"
-        "👀 بعد البناء تشوف معاينة فعلية قبل النشر النهائي، وتقدر تطلب تعديلات عليها قبل تأكيد النشر.\n\n"
-        "✏️ تعديل موقع منشور: اضغط زر تعديل، ثم أرسل نص أو صورة (مع وصف أو بدونه).\n\n"
-        "📷 صورة بدون نص: نسألك وصف الاستخدام بعدها.\n"
-        "📷 صورة مع نص: نطبّق التعديل فوراً.\n\n"
-        "/my — مشاريعك\n/stats — إحصائياتك\n/cancel — إلغاء أي محادثة أو تعديل جارٍ"
+        "📖 دليل الاستخدام الكامل\n\n"
+        "🏗 بناء مشروع جديد:\n"
+        "احكِ لي فكرتك، سأسألك عن التفاصيل الناقصة خطوة بخطوة.\n"
+        "عند الانتهاء قل: 'يلا ابدأ' أو 'سويها' أو 'تمام'.\n\n"
+        "🎮 الألعاب:\n"
+        "أبني ألعاباً كاملة (Sudoku, Blockudoku, Snake, Tetris, 2048...).\n"
+        "كل لعبة تشمل: منطق كامل + نقاط + حفظ أعلى نتيجة + تحكم موبايل.\n\n"
+        "✏️ التعديلات الذكية:\n"
+        "• 'غير الألوان للأزرق'\n"
+        "• 'أضف صفحة تسجيل دخول'\n"
+        "• 'حوّل اللعبة لـ Dark Mode'\n"
+        "• 'أصلح زر الإرسال'\n\n"
+        "📋 Version Control:\n"
+        "كل تعديل يُحفظ كإصدار منفصل. ارجع لأي نسخة سابقة متى شئت.\n\n"
+        "📷 الصور:\n"
+        "أرسل صورة (لوقو/منتج/خلفية) مع وصفها أو بدونه.\n"
+        "يمكن إزالة خلفية الصورة تلقائياً.\n\n"
+        "/my — مشاريعك\n"
+        "/stats — إحصائياتك\n"
+        "/cancel — إلغاء العملية الحالية"
     )
 
 
@@ -138,24 +175,36 @@ async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.message.from_user.id)
     projects = get_projects(uid)
     if not projects:
-        await update.message.reply_text("📭 لا توجد مشاريع نشطة.\n\nأرسل وصف موقعك لإنشاء أول مشروع! 🚀")
+        await update.message.reply_text(
+            "📭 لا توجد مشاريع بعد.\n\nأرسل فكرتك وأنا أبنيها! 🚀"
+        )
         return
     await update.message.reply_text(f"📂 مشاريعك ({len(projects)}):")
     for p in projects:
+        emoji = _type_emoji(p.get("project_type", "website"))
         await update.message.reply_text(
-            f"📛 {p['display_name']}\n🔗 {p['url']}",
-            reply_markup=_project_keyboard(p["name"], p["url"]),
+            f"{emoji} {p['display_name']}\n"
+            f"📌 نوع: {p.get('project_type', 'موقع')}\n"
+            f"🔢 الإصدار: {p.get('version_num', 1)}\n"
+            f"🔗 {p['url']}",
+            reply_markup=_project_keyboard(p["name"], p["url"], p.get("project_type", "website")),
             disable_web_page_preview=True
         )
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.message.from_user.id)
-    s = USER_STATS.get(uid, {"builds": 0, "edits": 0, "images": 0, "last_active": "—"})
+    stats = get_user_stats(uid)
     projects = get_projects(uid)
+    mem_stats = mem.memory_stats()
     await update.message.reply_text(
-        f"📊 إحصائياتك:\n\n🏗 مواقع: {s['builds']}\n✏️ تعديلات: {s['edits']}\n"
-        f"📷 صور: {s.get('images', 0)}\n📂 نشطة: {len(projects)}\n🕐 آخر نشاط: {s['last_active']}"
+        f"📊 إحصائياتك\n\n"
+        f"🏗 مشاريع منشأة: {stats['builds']}\n"
+        f"✏️ تعديلات: {stats['edits']}\n"
+        f"📷 صور مرفوعة: {stats['images']}\n"
+        f"📂 مشاريع نشطة: {len(projects)}\n"
+        f"🕐 آخر نشاط: {stats['last_active']}\n\n"
+        f"💾 الذاكرة النشطة: {mem_stats['cached_projects']} مشروع"
     )
 
 
@@ -164,54 +213,43 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     PENDING_IMAGE.pop(uid, None)
     PENDING_BUILD.pop(uid, None)
     PLANNING.pop(uid, None)
+    VERSION_MODE.pop(uid, None)
+
     if uid in RENAME_MODE:
         RENAME_MODE.pop(uid)
-        await update.message.reply_text("❌ تم إلغاء تعديل الاسم.")
+        await update.message.reply_text("❌ تم إلغاء تغيير الاسم.")
         return
     if uid in EDIT_MODE:
         proj = EDIT_MODE.pop(uid)
-        await update.message.reply_text(f"❌ تم إلغاء تعديل {proj}.")
+        await update.message.reply_text(f"❌ تم إلغاء تعديل '{proj}'.")
     else:
-        await update.message.reply_text("ℹ️ لست في وضع التعديل حالياً.")
+        await update.message.reply_text("ℹ️ لا توجد عملية جارية حالياً.")
 
 
-async def _do_build(update: Update, uid: str, text: str):
+# ─── Build & Deploy Flows ─────────────────────
+async def _do_build_from_conversation(update: Update, uid: str, conversation: list) -> Optional[dict]:
     await _typing(update)
-    await update.message.reply_text("⚙️ جاري بناء موقعك...\nالمحرك الذكي يحلل طلبك 🧠")
-    try:
-        log(f"[BUILD] uid={uid} req={text[:100]}")
-        data = safe_parse(builder(text))
-        if not data:
-            raise ValueError("safe_parse=None")
-        _track(uid, "builds")
-        log(f"[BUILD_OK] uid={uid} proj={data.get('projectName')}")
-        return data
-    except RuntimeError as e:
-        log(f"[BUILD_FAIL] uid={uid} err={e}")
-        await update.message.reply_text("⚠️ المحرك مشغول الآن، جاري رفع صفحة مؤقتة.\nأعد الطلب بعد لحظة.")
-        return _fallback(text, uid)
-    except Exception as e:
-        log(f"[BUILD_ERR] uid={uid} err={e}")
-        await update.message.reply_text("⚠️ خطأ غير متوقع، جاري رفع صفحة مؤقتة.")
-        return _fallback(text, uid)
-
-
-async def _do_build_from_conversation(update: Update, uid: str, conversation: list):
-    """يبني الموقع من كامل محادثة التخطيط — يضمن التزام AI بكل تفصيلة ذكرها المستخدم فقط."""
-    await _typing(update)
-    await update.message.reply_text("⚙️ تمام، جاري بناء موقعك بناءً على كل ما اتفقنا عليه 🧠")
     user_msgs = " ".join(m["content"] for m in conversation if m["role"] == "user")
+    ptype = _detect_project_type(user_msgs)
+    emoji = _type_emoji(ptype)
+    type_name = {"game": "لعبة", "store": "متجر", "dashboard": "داشبورد",
+                 "landing": "صفحة هبوط", "portfolio": "بورتفوليو", "app": "تطبيق"}.get(ptype, "موقع")
+    await update.message.reply_text(
+        f"{emoji} ممتاز! جاري بناء {type_name} بناءً على كل ما اتفقنا عليه...\n"
+        f"{'🎮 سيتضمن منطق لعبة كامل!' if ptype == 'game' else '⏳ هذا يستغرق 30-60 ثانية'}"
+    )
     try:
-        log(f"[BUILD_CONV] uid={uid} turns={len(conversation)}")
+        log(f"[BUILD_CONV] uid={uid} type={ptype} turns={len(conversation)}")
         data = safe_parse(build_from_conversation(conversation))
         if not data:
             raise ValueError("safe_parse=None")
-        _track(uid, "builds")
-        log(f"[BUILD_CONV_OK] uid={uid} proj={data.get('projectName')}")
+        data.setdefault("projectType", ptype)
+        increment_user_stat(uid, "builds_count")
+        log(f"[BUILD_CONV_OK] uid={uid} proj={data.get('projectName')} type={ptype}")
         return data
     except RuntimeError as e:
         log(f"[BUILD_CONV_FAIL] uid={uid} err={e}")
-        await update.message.reply_text("⚠️ المحرك مشغول الآن، جاري رفع صفحة مؤقتة.\nأعد الطلب بعد لحظة.")
+        await update.message.reply_text("⚠️ المحرك مشغول الآن، جاري رفع صفحة مؤقتة. أعد الطلب بعد قليل.")
         return _fallback(user_msgs, uid)
     except Exception as e:
         log(f"[BUILD_CONV_ERR] uid={uid} err={e}")
@@ -220,31 +258,33 @@ async def _do_build_from_conversation(update: Update, uid: str, conversation: li
 
 
 async def _do_edit(update: Update, uid: str, text: str, proj: str,
-                    image_url: Optional[str] = None, image_path: Optional[str] = None):
+                   image_url: Optional[str] = None, image_path: Optional[str] = None) -> Optional[dict]:
     await _typing(update)
-    await update.message.reply_text(f"🔄 معالجة التعديلات على {proj}...")
+    await update.message.reply_text(f"🔄 معالجة التعديل على '{proj}'...")
 
     local = get_project_files(uid, proj) or get_project_files_db(uid, proj)
     current = ""
     if local:
+        # حفظ النسخة الحالية قبل التعديل
+        save_version(uid, proj, local, description=f"قبل: {text[:80]}")
         for f in local:
             current += f"\n--- {f['path']} ---\n{f['content']}\n"
-        LAST_VERSION[proj] = {"files": local}
     else:
         await update.message.reply_text("⚠️ لم أجد الملفات، سيُعامَل كمشروع جديد.")
 
     try:
-        log(f"[EDIT] uid={uid} proj={proj} req={text[:100]} img={'yes' if image_url else 'no'}")
+        log(f"[EDIT] uid={uid} proj={proj} req={text[:100]}")
         data = safe_parse(editor(text, current_code=current, image_url=image_url, image_path=image_path))
         if not data:
             raise ValueError("safe_parse=None")
         data["projectName"] = proj
-        _track(uid, "edits")
+        increment_user_stat(uid, "edits_count")
+        mem.update_edit_context(proj, text)
         log(f"[EDIT_OK] uid={uid} proj={proj}")
         return data
     except RuntimeError as e:
         log(f"[EDIT_FAIL] uid={uid} err={e}")
-        await update.message.reply_text("❌ فشل التعديل بعد كل المحاولات.\nأرسل /cancel ثم أعد المحاولة.")
+        await update.message.reply_text("❌ فشل التعديل. أرسل /cancel ثم أعد المحاولة.")
         return None
     except Exception as e:
         log(f"[EDIT_ERR] uid={uid} err={e}")
@@ -252,71 +292,90 @@ async def _do_edit(update: Update, uid: str, text: str, proj: str,
         return None
 
 
-async def _do_preview(update: Update, uid: str, data: dict, is_edit: bool, original_proj: Optional[str] = None):
-    """
-    ينشر الموقع تحت اسم معاينة مؤقت ويعرضه فعلياً قابل للفتح.
-    يخزن data + preview_name بانتظار قرار المستخدم.
-    """
+async def _do_preview(update: Update, uid: str, data: dict,
+                      is_edit: bool, original_proj: Optional[str] = None):
     await _typing(update)
-    await update.message.reply_text("📦 جاري تحضير معاينة موقعك...")
+    await update.message.reply_text("📦 جاري تحضير معاينة...")
     try:
         preview_name = (
-            data["projectName"]
-            if is_edit
-            else f"preview-{data['projectName']}-{int(time.time()) % 10000}"
+            data["projectName"] if is_edit
+            else f"prev-{data['projectName']}-{int(time.time()) % 9999}"
         )
         preview_data = {**data, "projectName": preview_name}
-
         build_project(preview_data, uid)
         preview_url = deploy_project(preview_name, preview_data.get("files", []))
 
-        # ✅ نحفظ preview_name و preview_files عشان confirm_publish يستخدمهم مباشرة
         PENDING_BUILD[uid] = {
-            "data": data,
-            "is_edit": is_edit,
-            "proj": original_proj,
-            "preview_name": preview_name,
+            "data":          data,
+            "is_edit":       is_edit,
+            "proj":          original_proj,
+            "preview_name":  preview_name,
             "preview_files": preview_data.get("files", []),
         }
 
-        buttons = [
-            [InlineKeyboardButton("🌐 افتح المعاينة", url=preview_url)],
-            [InlineKeyboardButton("✅ نشر الموقع", callback_data="confirm_publish"),
-             InlineKeyboardButton("✏️ تعديل أكثر", callback_data="continue_edit")],
-        ]
-        if original_proj and original_proj in LAST_VERSION:
-            buttons.append([InlineKeyboardButton("↩️ رجوع للنسخة السابقة", callback_data="undo_edit")])
+        ptype = data.get("projectType", "website")
+        emoji = _type_emoji(ptype)
 
-        kb = InlineKeyboardMarkup(buttons)
+        has_prev_version = (
+            original_proj is not None and
+            len(get_versions(uid, original_proj)) > 1
+        )
+
+        buttons = [
+            [InlineKeyboardButton(f"{emoji} افتح المعاينة", url=preview_url)],
+            [InlineKeyboardButton("✅ نشر", callback_data="confirm_publish"),
+             InlineKeyboardButton("✏️ تعديل إضافي", callback_data="continue_edit")],
+        ]
+        if has_prev_version:
+            buttons.append([InlineKeyboardButton("↩️ استرجاع النسخة السابقة", callback_data="undo_edit")])
+
         await update.message.reply_text(
-            f"👀 هذي معاينة موقعك — افتحها وشوفها قبل ما تقرر:\n🔗 {preview_url}\n\n"
-            f"إذا عجبتك اضغط «نشر الموقع»، أو «تعديل أكثر» لمواصلة التحسين"
-            + (" أو «رجوع» لاسترجاع النسخة قبل هذا التعديل." if original_proj and original_proj in LAST_VERSION else "."),
-            reply_markup=kb,
+            f"👀 معاينتك جاهزة!\n🔗 {preview_url}\n\n"
+            f"افتح الرابط وتأكد، ثم اضغط:\n"
+            f"✅ نشر — للنشر النهائي\n"
+            f"✏️ تعديل إضافي — لمزيد من التعديلات"
+            + ("\n↩️ استرجاع — للرجوع للنسخة السابقة" if has_prev_version else ""),
+            reply_markup=InlineKeyboardMarkup(buttons),
         )
     except Exception as e:
         log(f"[PREVIEW_ERR] uid={uid} err={e}")
-        await update.message.reply_text("❌ فشل تحضير المعاينة. تحقق من إعدادات السيرفر (BASE_URL).")
+        await update.message.reply_text("❌ فشل تحضير المعاينة. تأكد من ضبط BASE_URL.")
 
 
-async def _do_deploy(update: Update, uid: str, data: dict):
-    """نشر نهائي مباشر بالاسم الحقيقي."""
+async def _do_deploy(update: Update, uid: str, data: dict,
+                     files_override: list = None) -> Optional[str]:
     await _typing(update)
-    await update.message.reply_text("📦 رفع الملفات...")
     try:
-        build_project(data, uid)
-        url = deploy_project(data["projectName"], data.get("files", []))
-        add_project(uid, data["projectName"], url, data.get("files", []))
-        log(f"[DEPLOY_OK] uid={uid} proj={data['projectName']} url={url}")
+        final_name  = data["projectName"]
+        final_files = files_override or data.get("files", [])
+        final_data  = {**data, "files": final_files}
+        ptype       = data.get("projectType", "website")
+
+        build_project(final_data, uid)
+        url = deploy_project(final_name, final_files)
+
+        # حفظ في DB
+        add_project(uid, final_name, url, final_files, project_type=ptype)
+        save_version(uid, final_name, final_files, description="النشر الأولي")
+        mem.set_last(uid, final_data)
+
+        log(f"[DEPLOY_OK] uid={uid} proj={final_name} type={ptype} url={url}")
+        emoji = _type_emoji(ptype)
         await update.message.reply_text(
-            f"✅ موقعك جاهز!\n\n📛 الاسم: {data['projectName']}\n🔗 {url}\n\nاستخدم الأزرار 👇",
-            reply_markup=_project_keyboard(data["projectName"], url),
+            f"✅ {emoji} تم النشر!\n\n"
+            f"📛 الاسم: {final_name}\n"
+            f"🔢 الإصدار: 1\n"
+            f"🔗 {url}\n\nاستخدم الأزرار 👇",
+            reply_markup=_project_keyboard(final_name, url, ptype),
         )
+        return url
     except Exception as e:
         log(f"[DEPLOY_ERR] uid={uid} err={e}")
         await update.message.reply_text("❌ فشل الرفع. تحقق من إعدادات السيرفر (BASE_URL).")
+        return None
 
 
+# ─── Photo Handling ───────────────────────────
 async def _save_photo(update: Update, uid: str) -> Optional[dict]:
     try:
         photo = update.message.photo[-1]
@@ -324,60 +383,54 @@ async def _save_photo(update: Update, uid: str) -> Optional[dict]:
         filename = f"{uid}_{int(time.time())}.jpg"
         local_path = os.path.join(UPLOADS_DIR, filename)
         await tg_file.download_to_drive(local_path)
-
         if not PUBLIC_BASE:
-            log(f"[IMG_WARN] uid={uid} BASE_URL غير مضبوط")
             return {"path": local_path, "url": ""}
-
         url = f"{PUBLIC_BASE}/s/_uploads/{filename}"
-        log(f"[IMG_OK] uid={uid} url={url}")
+        log(f"[PHOTO_SAVED] uid={uid} url={url}")
         return {"path": local_path, "url": url}
     except Exception as e:
-        log(f"[IMG_ERR] uid={uid} err={e}")
+        log(f"[PHOTO_ERR] uid={uid} err={e}")
         return None
 
 
 class _FakeUpdate:
-    """غلاف بسيط يجعل CallbackQuery.message يبدو كـ Update.message للدوال التي تتوقع update.message.reply_text."""
     def __init__(self, message):
         self.message = message
 
 
 async def _continue_photo_flow(update, uid: str, saved: dict, caption: str):
-    """
-    يكمل معالجة الصورة بعد تحديد قرار إزالة الخلفية.
-    """
     if uid in EDIT_MODE:
         if caption:
             proj = EDIT_MODE.pop(uid)
-            _track(uid, "images")
-            data = await _do_edit(update, uid, caption, proj, image_url=saved["url"], image_path=saved["path"])
+            increment_user_stat(uid, "images_count")
+            data = await _do_edit(update, uid, caption, proj,
+                                   image_url=saved["url"], image_path=saved["path"])
             if data:
                 await _do_preview(update, uid, data, is_edit=True, original_proj=proj)
         else:
             PENDING_IMAGE[uid] = saved
             await update.message.reply_text(
-                "📸 تمام. أرسل الآن وصف كيف تريد استخدامها:\n"
-                "مثلاً: خلي اللوقو هذي الصورة / هذا المنتج حط له هذي الصورة."
+                "📸 استلمت الصورة. أرسل الآن وصف كيف تريد استخدامها:\n"
+                "مثلاً: 'خلي هذي الصورة اللوقو' أو 'هذا المنتج أضف صورته'"
             )
         return
 
     if not caption:
-        await update.message.reply_text(
-            "📸 تمام. أرسل وصفاً يوضح فكرة الموقع المطلوب "
-            "(مثلاً: سوّي متجر إلكترونيات وخلي هذي الصورة اللوقو)."
-        )
         PENDING_IMAGE[uid] = saved
+        await update.message.reply_text(
+            "📸 استلمت الصورة. أرسل وصفاً للمشروع الذي تريده:\n"
+            "مثلاً: 'سوّي متجر إلكترونيات وخلي هذه الصورة اللوقو'"
+        )
         return
 
     history = PLANNING.setdefault(uid, [])
-    history.append({"role": "user", "content": f"{caption} [صورة مرفقة: {saved['url']}]"})
+    history.append({"role": "user", "content": f"{caption} [صورة: {saved['url']}]"})
 
     try:
         reply_text, ready = plan_chat(history)
     except RuntimeError as e:
-        log(f"[PLAN_CHAT_PHOTO_FAIL] uid={uid} err={e}")
-        await update.message.reply_text("⚠️ المحرك مشغول الآن، حاول إعادة الإرسال بعد لحظة.")
+        log(f"[PLAN_PHOTO_FAIL] uid={uid} err={e}")
+        await update.message.reply_text("⚠️ المحرك مشغول، حاول مجدداً.")
         return
 
     history.append({"role": "assistant", "content": reply_text})
@@ -390,26 +443,21 @@ async def _continue_photo_flow(update, uid: str, saved: dict, caption: str):
     data = await _do_build_from_conversation(update, uid, history)
     PLANNING.pop(uid, None)
     PENDING_IMAGE.pop(uid, None)
-
     if data:
-        await _do_preview(update, uid, data, is_edit=False, original_proj=None)
+        await _do_preview(update, uid, data, is_edit=False)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """مضمون يرد دائماً — أي خطأ غير متوقع يُمسك في try/except خارجي شامل."""
     uid = str(update.message.from_user.id)
     try:
         await _typing(update)
         saved = await _save_photo(update, uid)
-
         if not saved:
-            await update.message.reply_text("⚠️ حدث خطأ أثناء حفظ الصورة. حاول مرة أخرى.")
+            await update.message.reply_text("⚠️ خطأ في حفظ الصورة. حاول مرة أخرى.")
             return
-
         if not saved["url"]:
             await update.message.reply_text(
-                "⚠️ تعذّر توليد رابط عام للصورة لأن BASE_URL غير مضبوط بالسيرفر.\n"
-                "أضف متغير BASE_URL في Render Environment Variables بقيمة رابط موقعك (https://...)."
+                "⚠️ تعذّر توليد رابط للصورة. أضف BASE_URL في متغيرات البيئة."
             )
             return
 
@@ -417,29 +465,28 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         saved["caption"] = caption
         PENDING_IMAGE[uid] = saved
 
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🪄 إزالة الخلفية", callback_data="rmbg_yes"),
-             InlineKeyboardButton("➡️ تجاوز", callback_data="rmbg_no")],
-        ])
         await update.message.reply_text(
-            "📸 استلمت الصورة. تبي أزيل الخلفية منها قبل الاستخدام؟",
-            reply_markup=kb,
+            "📸 استلمت الصورة. تبي أزيل الخلفية منها أولاً؟",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🪄 إزالة الخلفية", callback_data="rmbg_yes"),
+                 InlineKeyboardButton("➡️ تجاوز", callback_data="rmbg_no")],
+            ])
         )
-
     except Exception as e:
-        log(f"[PHOTO_HANDLER_FATAL] uid={uid} err={e}")
+        log(f"[PHOTO_HANDLER_ERR] uid={uid} err={e}")
         try:
-            await update.message.reply_text("❌ حدث خطأ غير متوقع أثناء معالجة الصورة. حاول مرة أخرى أو أرسل /cancel.")
+            await update.message.reply_text("❌ خطأ في معالجة الصورة. حاول مرة أخرى.")
         except Exception:
             pass
 
 
+# ─── Main Message Handler ─────────────────────
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.message.from_user.id)
     try:
         text = (update.message.text or "").strip()
         if not text:
-            await update.message.reply_text("⚠️ الرسالة فارغة، أرسل وصف موقعك.")
+            await update.message.reply_text("⚠️ الرسالة فارغة، أرسل وصف مشروعك.")
             return
 
         allowed, remaining = _allow(uid)
@@ -447,47 +494,50 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⏳ انتظر {remaining} ثانية بين الطلبات.")
             return
 
-        # ── وضع تعديل الاسم ─────────────────────
+        # تحديث بيانات المستخدم
+        user = update.message.from_user
+        upsert_user(uid, user.username or "", user.first_name or "")
+
+        # ── وضع تغيير الاسم ─────────────────────
         if uid in RENAME_MODE:
             proj = RENAME_MODE.pop(uid)
-            new_name = text.strip()
-            try:
-                rename_project(uid, proj, new_name)
-                await update.message.reply_text(f"✅ تم تغيير الاسم إلى: {new_name}")
-            except Exception as e:
-                log(f"[RENAME_ERR] uid={uid} proj={proj} err={e}")
-                await update.message.reply_text("❌ فشل تغيير الاسم، حاول مرة أخرى.")
+            rename_project(uid, proj, text.strip())
+            await update.message.reply_text(f"✅ تم تغيير الاسم إلى: {text.strip()}")
             return
 
+        # ── وضع التعديل ─────────────────────────
         if uid in EDIT_MODE:
             proj = EDIT_MODE.pop(uid)
             pending = PENDING_IMAGE.pop(uid, None)
             if pending:
-                _track(uid, "images")
-                data = await _do_edit(update, uid, text, proj, image_url=pending["url"], image_path=pending["path"])
+                increment_user_stat(uid, "images_count")
+                data = await _do_edit(update, uid, text, proj,
+                                       image_url=pending["url"], image_path=pending["path"])
             else:
                 data = await _do_edit(update, uid, text, proj)
-            if not data:
-                return
-            await _do_preview(update, uid, data, is_edit=True, original_proj=proj)
+            if data:
+                await _do_preview(update, uid, data, is_edit=True, original_proj=proj)
             return
 
-        # ── محادثة تخطيط قبل البناء ──────────────
+        # ── محادثة التخطيط ───────────────────────
         history = PLANNING.setdefault(uid, [])
 
         pending_img = PENDING_IMAGE.pop(uid, None)
         if pending_img:
-            history.append({"role": "user", "content": f"{text} [صورة مرفقة: {pending_img['url']}]"})
-            _track(uid, "images")
+            history.append({"role": "user", "content": f"{text} [صورة: {pending_img['url']}]"})
+            increment_user_stat(uid, "images_count")
         else:
             history.append({"role": "user", "content": text})
+
+        # حفظ تاريخ المحادثة
+        mem.set_history(uid, history)
 
         await _typing(update)
         try:
             reply_text, ready = plan_chat(history)
         except RuntimeError as e:
-            log(f"[PLAN_CHAT_FAIL] uid={uid} err={e}")
-            await update.message.reply_text("⚠️ المحرك مشغول الآن، حاول إعادة كتابة طلبك بعد لحظة.")
+            log(f"[PLAN_FAIL] uid={uid} err={e}")
+            await update.message.reply_text("⚠️ المحرك مشغول، حاول مرة أخرى.")
             return
 
         history.append({"role": "assistant", "content": reply_text})
@@ -499,140 +549,133 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply_text)
         data = await _do_build_from_conversation(update, uid, history)
         PLANNING.pop(uid, None)
+        mem.clear_history(uid)
 
-        if not data:
-            return
-
-        await _do_preview(update, uid, data, is_edit=False, original_proj=None)
+        if data:
+            await _do_preview(update, uid, data, is_edit=False)
 
     except Exception as e:
         log(f"[HANDLE_FATAL] uid={uid} err={e}")
         try:
-            await update.message.reply_text("❌ حدث خطأ غير متوقع. حاول مرة أخرى أو أرسل /cancel.")
+            await update.message.reply_text("❌ خطأ غير متوقع. حاول مرة أخرى أو أرسل /cancel.")
         except Exception:
             pass
 
 
+# ─── Callback Handler ─────────────────────────
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = str(q.from_user.id)
 
-    # ── confirm_publish ──────────────────────────
+    # ── confirm_publish ──────────────────────
     if q.data == "confirm_publish":
         pending = PENDING_BUILD.pop(uid, None)
         if not pending:
-            await q.message.reply_text("⚠️ لا توجد معاينة بانتظار النشر. أرسل طلب جديد.")
+            await q.message.reply_text("⚠️ لا توجد معاينة بانتظار النشر.")
             return
+        data        = pending["data"]
+        final_files = pending.get("preview_files") or data.get("files", [])
+        final_data  = {**data, "files": final_files}
+        ptype       = data.get("projectType", "website")
+
         try:
-            data        = pending["data"]
-            final_name  = data["projectName"]
-            # ✅ الملفات الصحيحة: نأخذها من preview_files (هي المبنية فعلاً)
-            final_files = pending.get("preview_files") or data.get("files", [])
-
-            # نحدّث الـ data باسم نهائي ثابت وملفاته الصحيحة
-            final_data = {**data, "projectName": final_name, "files": final_files}
-
             build_project(final_data, uid)
-            url = deploy_project(final_name, final_files)
-            add_project(uid, final_name, url, final_files)
-            log(f"[PUBLISH_OK] uid={uid} proj={final_name} url={url}")
+            url = deploy_project(data["projectName"], final_files)
+            add_project(uid, data["projectName"], url, final_files, project_type=ptype)
+            save_version(uid, data["projectName"], final_files, "النشر الأولي")
+            mem.set_last(uid, final_data)
+            emoji = _type_emoji(ptype)
             await q.message.reply_text(
-                f"✅ تم النشر النهائي!\n\n📛 الاسم: {final_name}\n🔗 {url}\n\nاستخدم الأزرار 👇",
-                reply_markup=_project_keyboard(final_name, url),
+                f"✅ {emoji} تم النشر!\n\n📛 {data['projectName']}\n🔗 {url}",
+                reply_markup=_project_keyboard(data["projectName"], url, ptype),
             )
         except Exception as e:
             log(f"[PUBLISH_ERR] uid={uid} err={e}")
-            await q.message.reply_text("❌ فشل النشر النهائي. حاول مرة أخرى.")
+            await q.message.reply_text("❌ فشل النشر. حاول مرة أخرى.")
         return
 
-    # ── rmbg ────────────────────────────────────
+    # ── rmbg ────────────────────────────────
     if q.data in ("rmbg_yes", "rmbg_no"):
         saved = PENDING_IMAGE.get(uid)
         if not saved:
             await q.message.reply_text("⚠️ لم أجد الصورة، أرسلها مرة أخرى.")
             return
-
         caption = saved.get("caption", "")
 
         if q.data == "rmbg_yes":
-            await q.message.reply_text("🪄 جاري إزالة الخلفية، ثواني...")
+            await q.message.reply_text("🪄 جاري إزالة الخلفية...")
             try:
                 with open(saved["path"], "rb") as f:
                     raw = f.read()
-
                 try:
-                    # ✅ 35 ثانية كافية لـ remove.bg API
                     processed = await asyncio.wait_for(
-                        asyncio.to_thread(remove_background, raw),
-                        timeout=35,
+                        asyncio.to_thread(remove_background, raw), timeout=35
                     )
-                    new_filename = os.path.basename(saved["path"]).rsplit(".", 1)[0] + "_nobg.png"
-                    new_path = os.path.join(UPLOADS_DIR, new_filename)
+                    new_fname = os.path.basename(saved["path"]).rsplit(".", 1)[0] + "_nobg.png"
+                    new_path  = os.path.join(UPLOADS_DIR, new_fname)
                     with open(new_path, "wb") as f:
                         f.write(processed)
                     saved["path"] = new_path
-                    saved["url"] = f"{PUBLIC_BASE}/s/_uploads/{new_filename}" if PUBLIC_BASE else saved["url"]
-                    log(f"[RMBG_APPLIED] uid={uid} file={new_filename}")
-                    await q.message.reply_text("✅ تمت إزالة الخلفية بنجاح.")
+                    saved["url"]  = f"{PUBLIC_BASE}/s/_uploads/{new_fname}" if PUBLIC_BASE else saved["url"]
+                    await q.message.reply_text("✅ تمت إزالة الخلفية.")
                 except asyncio.TimeoutError:
-                    log(f"[RMBG_TIMEOUT] uid={uid}")
-                    # ✅ بدل ما نتجاهل الطلب، نكمل بالصورة الأصلية بدون إيقاف التدفق
-                    await q.message.reply_text("⏱ إزالة الخلفية تأخرت، سنكمل بالصورة الأصلية تلقائياً.")
+                    await q.message.reply_text("⏱ استغرق وقتاً طويلاً، سنكمل بالصورة الأصلية.")
             except Exception as e:
-                log(f"[RMBG_CALLBACK_ERR] uid={uid} err={e}")
-                await q.message.reply_text("⚠️ تعذّرت إزالة الخلفية، سنستخدم الصورة الأصلية.")
+                log(f"[RMBG_ERR] uid={uid} err={e}")
+                await q.message.reply_text("⚠️ تعذّرت إزالة الخلفية، نكمل بالصورة الأصلية.")
         else:
             await q.message.reply_text("➡️ تم تجاوز إزالة الخلفية.")
 
-        # ✅ في جميع الحالات (نجاح / timeout / خطأ) نكمل التدفق
         await _continue_photo_flow(_FakeUpdate(q.message), uid, saved, caption)
         return
 
-    # ── continue_edit ────────────────────────────
+    # ── continue_edit ────────────────────────
     if q.data == "continue_edit":
         pending = PENDING_BUILD.get(uid)
         if not pending:
-            await q.message.reply_text("⚠️ لا توجد معاينة حالية للتعديل عليها. أرسل طلب جديد.")
+            await q.message.reply_text("⚠️ لا توجد معاينة حالية.")
             return
         EDIT_MODE[uid] = pending["preview_name"]
         await q.message.reply_text(
-            "✏️ تمام، أرسل الآن التغييرات التي تريدها على المعاينة.\n"
-            "بعد التعديل سأعرض لك معاينة جديدة قبل النشر."
+            "✏️ أرسل التعديلات الإضافية:\n"
+            "مثلاً: 'غير لون الهيدر للأحمر' أو 'أضف قسم الأسعار'\n"
+            "للإلغاء: /cancel"
         )
         return
 
-    # ── undo_edit ────────────────────────────────
+    # ── undo_edit ────────────────────────────
     if q.data == "undo_edit":
         pending = PENDING_BUILD.get(uid)
         if not pending or not pending.get("proj"):
-            await q.message.reply_text("⚠️ لا توجد نسخة سابقة محفوظة بهذه اللحظة.")
+            await q.message.reply_text("⚠️ لا توجد نسخة سابقة محددة.")
             return
-
         original_proj = pending["proj"]
-        backup = LAST_VERSION.get(original_proj)
-        if not backup:
-            await q.message.reply_text("⚠️ لا توجد نسخة سابقة محفوظة لهذا المشروع.")
+        versions = get_versions(uid, original_proj)
+        if len(versions) < 2:
+            await q.message.reply_text("⚠️ لا توجد نسخة سابقة.")
             return
-
-        await q.message.reply_text(f"↩️ جاري استرجاع النسخة السابقة من {original_proj}...")
+        prev_ver = versions[1]["version"]  # النسخة قبل الأخيرة
+        files = get_version_files(uid, original_proj, prev_ver)
+        if not files:
+            await q.message.reply_text("⚠️ لم أجد ملفات النسخة السابقة.")
+            return
         try:
-            restore_data = {"projectName": original_proj, "files": backup["files"]}
+            restore_data = {"projectName": original_proj, "files": files}
             build_project(restore_data, uid)
-            url = deploy_project(original_proj, backup["files"])
-            add_project(uid, original_proj, url, backup["files"])
-            LAST_VERSION.pop(original_proj, None)
+            url = deploy_project(original_proj, files)
+            update_project_files(uid, original_proj, files, url)
             PENDING_BUILD.pop(uid, None)
-            log(f"[UNDO_OK] uid={uid} proj={original_proj}")
             await q.message.reply_text(
-                f"✅ تم استرجاع النسخة السابقة بنجاح!\n\n📛 {original_proj}\n🔗 {url}",
+                f"✅ تم استرجاع الإصدار {prev_ver} بنجاح!\n🔗 {url}",
                 reply_markup=_project_keyboard(original_proj, url),
             )
         except Exception as e:
-            log(f"[UNDO_ERR] uid={uid} proj={original_proj} err={e}")
+            log(f"[UNDO_ERR] uid={uid} err={e}")
             await q.message.reply_text("❌ فشل استرجاع النسخة السابقة.")
         return
 
+    # ── actions بالـ pipe ─────────────────────
     if "|" not in q.data:
         return
 
@@ -643,33 +686,60 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "edit":
         EDIT_MODE[uid] = proj
         await q.message.reply_text(
-            f"✏️ وضع تعديل: {proj}\n\nأرسل التغييرات بالتفصيل، أو صورة (مع وصف أو بدونه).\nللإلغاء: /cancel"
+            f"✏️ وضع تعديل: '{proj}'\n\n"
+            "أرسل التعديل المطلوب بالتفصيل:\n"
+            "• 'غير لون الأزرار للأخضر'\n"
+            "• 'أضف قسم التواصل'\n"
+            "• 'حوّل للـ Dark Mode'\n"
+            "• أو أرسل صورة مع وصف\n\n"
+            "للإلغاء: /cancel"
         )
+
     elif action == "rename":
         RENAME_MODE[uid] = proj
         await q.message.reply_text(
-            "📝 أرسل الآن الاسم الجديد اللي تبيه يظهر بقائمة /my.\n"
-            "ملاحظة: هذا لا يغيّر رابط الموقع، فقط الاسم اللي تشوفه عندك.\nللإلغاء: /cancel"
+            f"📝 أرسل الاسم الجديد الذي تريده يظهر في /my:\n"
+            f"(لن يتغير رابط الموقع)\n"
+            f"للإلغاء: /cancel"
         )
+
+    elif action == "versions":
+        versions = get_versions(uid, proj)
+        if not versions:
+            await q.message.reply_text(f"📋 لا توجد إصدارات محفوظة لـ '{proj}' بعد.")
+            return
+        text = f"📋 إصدارات '{proj}' ({len(versions)}):\n\n"
+        for v in versions[:10]:  # أحدث 10 نسخ
+            text += f"🔢 الإصدار {v['version']}: {v['description'] or 'بدون وصف'} — {v['created_at'][:16]}\n"
+        if len(versions) > 1:
+            text += f"\nاضغط '↩️ استرجاع' في المعاينة لاسترجاع النسخة السابقة."
+        await q.message.reply_text(text)
+
     elif action == "del":
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ نعم، احذف", callback_data=f"confirm_del|{proj}"),
-             InlineKeyboardButton("❌ إلغاء", callback_data=f"cancel_del|{proj}")],
-        ])
-        await q.message.reply_text(f"⚠️ هل أنت متأكد من حذف {proj}؟", reply_markup=kb)
+        await q.message.reply_text(
+            f"⚠️ هل تريد حذف '{proj}'؟",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ نعم احذف", callback_data=f"confirm_del|{proj}"),
+                 InlineKeyboardButton("❌ إلغاء", callback_data=f"cancel_del|{proj}")],
+            ])
+        )
+
     elif action == "confirm_del":
-        await q.message.reply_text(f"🗑 جاري حذف {proj}...")
+        await q.message.reply_text(f"🗑 جاري حذف '{proj}'...")
         try:
             delete_vercel_project(proj)
-        except Exception as e:
-            log(f"[DEL_LOCAL_ERR] proj={proj} err={e}")
+        except Exception:
+            pass
         delete_project_files(uid, proj)
         delete_project(uid, proj)
-        await q.message.reply_text(f"✅ تم حذف {proj} بنجاح.")
+        mem.clear(uid)
+        await q.message.reply_text(f"✅ تم حذف '{proj}' بنجاح.")
+
     elif action == "cancel_del":
         await q.message.reply_text("↩️ تم إلغاء الحذف.")
 
 
+# ─── App Setup ────────────────────────────────
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler("start",  cmd_start))
 app.add_handler(CommandHandler("help",   cmd_help))
@@ -681,5 +751,5 @@ app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 app.add_handler(CallbackQueryHandler(handle_callback))
 
 if __name__ == "__main__":
-    log("✅ البوت يعمل — النسخة المطورة")
+    log("✅ البوت يعمل — النسخة المطورة الكاملة")
     app.run_polling()
