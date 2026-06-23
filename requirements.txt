@@ -22,8 +22,5 @@ requests==2.32.3
 # rembg==2.0.57
 # onnxruntime==1.19.2
 
-# ── Web Search ────────────────────────────────
-# tavily-python==0.3.3   (اختياري - نستخدم requests مباشرة)
-
 # ── Utilities ─────────────────────────────────
-pydantic==2.8.2
+pydantic>=2.11.7
