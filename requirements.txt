@@ -12,7 +12,7 @@ flask==3.0.3
 flask-compress==1.15
 
 # ── Database ──────────────────────────────────
-libsql==0.3.1
+libsql==0.1.11
 
 # ── Image Processing ──────────────────────────
 pillow==10.4.0
