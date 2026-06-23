@@ -1,6 +1,5 @@
 """
-deploy.py — نشر المواقع محلياً على القرص + استرجاعها من Turso بعد كل إعادة تشغيل.
-يشمل أيضاً: حفظ الصور المرفوعة + إزالة الخلفية عبر remove.bg API.
+deploy.py — نشر المواقع على القرص + استرجاعها من Turso — النسخة المطورة.
 """
 import os
 import shutil
@@ -15,106 +14,133 @@ BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 
 
 def _write_to_disk(name: str, files: list):
+    """يكتب ملفات الموقع على القرص."""
     project_dir = os.path.join(SITES_DIR, name)
     os.makedirs(project_dir, exist_ok=True)
     for f in files:
         path = os.path.join(project_dir, f["path"])
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fp:
-            fp.write(f["content"])
+        try:
+            with open(path, "w", encoding="utf-8") as fp:
+                fp.write(f["content"])
+        except OSError as e:
+            log(f"[DEPLOY_WRITE_ERR] name={name} path={f['path']} err={e}")
 
 
 def deploy_project(name: str, files: list) -> str:
+    """ينشر الموقع محلياً ويرجع رابطه."""
     if not BASE_URL:
         raise Exception("BASE_URL غير محدد في متغيرات البيئة!")
     _write_to_disk(name, files)
     url = f"{BASE_URL}/s/{name}/"
-    log(f"[DEPLOY_LOCAL] project={name} url={url}")
+    log(f"[DEPLOY_OK] project={name} url={url} files={len(files)}")
     return url
 
 
 def delete_vercel_project(name: str):
+    """يحذف مجلد الموقع من القرص."""
     project_dir = os.path.join(SITES_DIR, name)
     if os.path.exists(project_dir):
         shutil.rmtree(project_dir)
-        log(f"[DELETE_LOCAL] project={name}")
+        log(f"[DELETE_OK] project={name}")
 
 
-def save_uploaded_image(project_name: str, filename: str, raw_bytes: bytes, mime: str = "image/jpeg") -> str:
-    """يحفظ الصورة على القرص + Turso (دائمة)، ويرجع رابطها العام."""
-    from store import save_image
+def save_uploaded_image(project_name: str, filename: str,
+                         raw_bytes: bytes, mime: str = "image/jpeg") -> str:
+    """يحفظ صورة على القرص + قاعدة البيانات."""
+    from store import save_asset
+    import time
 
     uploads_dir = os.path.join(SITES_DIR, project_name, "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
     local_path = os.path.join(uploads_dir, filename)
+
     with open(local_path, "wb") as fp:
         fp.write(raw_bytes)
 
-    b64 = base64.b64encode(raw_bytes).decode("utf-8")
-    save_image(project_name, filename, b64, mime)
+    b64  = base64.b64encode(raw_bytes).decode("utf-8")
+    url  = f"{BASE_URL}/s/{project_name}/uploads/{filename}" if BASE_URL else ""
+    save_asset(project_name, "system", filename, b64, mime, url)
 
     log(f"[IMAGE_SAVED] project={project_name} file={filename}")
-    return f"{BASE_URL}/s/{project_name}/uploads/{filename}"
+    return url
 
 
 def remove_background(raw_bytes: bytes) -> bytes:
     """
-    يزيل خلفية صورة عبر remove.bg API ويرجع bytes الصورة الناتجة (PNG شفاف).
-    يتطلب متغير بيئة REMOVE_BG_API_KEY.
-    لو المفتاح غير موجود أو فشل الطلب، يرجع الصورة الأصلية بدون تعديل (fail-safe).
+    يزيل خلفية صورة عبر remove.bg API.
+    يرجع الصورة الأصلية عند أي فشل (fail-safe).
     """
     api_key = os.getenv("REMOVE_BG_API_KEY", "")
-
     if not api_key:
-        log("[BG_REMOVE_SKIP] REMOVE_BG_API_KEY غير مضبوط — تخطي إزالة الخلفية")
+        log("[RMBG_SKIP] REMOVE_BG_API_KEY غير مضبوط")
         return raw_bytes
 
     try:
-        response = requests.post(
+        resp = requests.post(
             "https://api.remove.bg/v1.0/removebg",
             files={"image_file": ("image.jpg", raw_bytes, "image/jpeg")},
             data={"size": "auto"},
             headers={"X-Api-Key": api_key},
             timeout=30,
         )
-
-        if response.status_code == 200:
-            log("[BG_REMOVE_OK] remove.bg نجحت")
-            return response.content  # PNG شفاف جاهز
-        else:
-            log(f"[BG_REMOVE_API_ERR] status={response.status_code} body={response.text[:200]}")
-            return raw_bytes
-
+        if resp.status_code == 200:
+            log("[RMBG_OK]")
+            return resp.content
+        log(f"[RMBG_API_ERR] status={resp.status_code} body={resp.text[:200]}")
+        return raw_bytes
     except requests.exceptions.Timeout:
-        log("[BG_REMOVE_TIMEOUT] انتهت مهلة remove.bg API")
+        log("[RMBG_TIMEOUT]")
         return raw_bytes
     except Exception as e:
-        log(f"[BG_REMOVE_ERR] {e}")
+        log(f"[RMBG_ERR] {e}")
         return raw_bytes
 
 
 def restore_all_sites_from_db():
     """
-    يُستدعى عند بدء تشغيل السيرفر: يعيد كتابة كل المواقع والصور المحفوظة
-    بقاعدة بيانات Turso إلى القرص المحلي (Render يمسح القرص عند كل إعادة تشغيل).
+    يُستدعى عند بدء التشغيل: يعيد كل المواقع + الصور + Assets من Turso للقرص.
     """
-    from store import get_all_projects, get_all_images
+    from store import get_all_projects, get_all_images, get_all_assets
 
-    projects = get_all_projects()
-    for p in projects:
-        if p["files"]:
-            _write_to_disk(p["name"], p["files"])
-    log(f"[RESTORE_SITES] استرجاع {len(projects)} مشروع")
+    # استرجاع المواقع
+    try:
+        projects = get_all_projects()
+        restored = 0
+        for p in projects:
+            if p.get("files"):
+                _write_to_disk(p["name"], p["files"])
+                restored += 1
+        log(f"[RESTORE_SITES] تم استرجاع {restored}/{len(projects)} موقع")
+    except Exception as e:
+        log(f"[RESTORE_SITES_ERR] {e}")
 
-    images = get_all_images()
-    for img in images:
-        uploads_dir = os.path.join(SITES_DIR, img["project_name"], "uploads")
-        os.makedirs(uploads_dir, exist_ok=True)
-        local_path = os.path.join(uploads_dir, img["filename"])
-        try:
-            raw = base64.b64decode(img["b64_data"])
-            with open(local_path, "wb") as fp:
-                fp.write(raw)
-        except Exception as e:
-            log(f"[RESTORE_IMAGE_ERR] {img['filename']} err={e}")
-    log(f"[RESTORE_IMAGES] استرجاع {len(images)} صورة")
+    # استرجاع الصور (الجدول القديم)
+    try:
+        images = get_all_images()
+        for img in images:
+            uploads_dir = os.path.join(SITES_DIR, img["project_name"], "uploads")
+            os.makedirs(uploads_dir, exist_ok=True)
+            local_path = os.path.join(uploads_dir, img["filename"])
+            if not os.path.exists(local_path):
+                raw = base64.b64decode(img["b64_data"])
+                with open(local_path, "wb") as f:
+                    f.write(raw)
+        log(f"[RESTORE_IMAGES] تم استرجاع {len(images)} صورة")
+    except Exception as e:
+        log(f"[RESTORE_IMAGES_ERR] {e}")
+
+    # استرجاع Assets الجديدة
+    try:
+        assets = get_all_assets()
+        for asset in assets:
+            project_dir = os.path.join(SITES_DIR, asset["project_name"], "uploads")
+            os.makedirs(project_dir, exist_ok=True)
+            local_path = os.path.join(project_dir, asset["filename"])
+            if not os.path.exists(local_path):
+                raw = base64.b64decode(asset["b64_data"])
+                with open(local_path, "wb") as f:
+                    f.write(raw)
+        log(f"[RESTORE_ASSETS] تم استرجاع {len(assets)} asset")
+    except Exception as e:
+        log(f"[RESTORE_ASSETS_ERR] {e}")
