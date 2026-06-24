@@ -15,8 +15,8 @@ libsql==0.1.11
 # ── Image Processing ──────────────────────────
 pillow==10.4.0
 requests==2.32.3
-rembg==2.0.59
-onnxruntime==1.19.2
+rembg==2.0.68
+onnxruntime==1.27.0
 
 # ── Utilities ─────────────────────────────────
 pydantic==2.9.2
