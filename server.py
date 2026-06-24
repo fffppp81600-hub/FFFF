@@ -7,10 +7,12 @@ server.py — سيرفر Flask + تشغيل البوت — النسخة المط
   - MIME types صحيحة لكل أنواع الملفات
   - حماية من directory traversal
   - ضغط الردود (gzip)
+  - إصلاح event loop لـ Python 3.13+/3.14 (RuntimeError: no current event loop)
 """
 import os
 import threading
 import mimetypes
+import asyncio
 from flask import Flask, send_from_directory, abort, jsonify, Response
 from logger import log
 
@@ -84,18 +86,15 @@ def api_status():
 @app.route("/s/<name>/<path:filename>")
 def serve_site(name, filename="index.html"):
     """يخدم ملفات الموقع مع حماية من traversal."""
-    # حماية: لا نسمح بمسارات تخرج عن SITES_DIR
     site_dir = os.path.realpath(os.path.join(SITES_DIR, name))
     if not site_dir.startswith(os.path.realpath(SITES_DIR)):
         abort(403)
     if not os.path.exists(site_dir):
         abort(404)
 
-    # تحديد MIME type الصحيح
     mime, _ = mimetypes.guess_type(filename)
     response = send_from_directory(site_dir, filename, mimetype=mime)
 
-    # Cache headers
     if filename.endswith((".css", ".js")):
         response.cache_control.max_age = 3600
     elif filename.endswith((".jpg", ".jpeg", ".png", ".webp", ".ico")):
@@ -134,15 +133,19 @@ def restore_all_from_db():
 if __name__ == "__main__":
     log("🚀 بدء تشغيل منصة AI Website Builder")
 
-    # استرجاع المواقع من DB أولاً
     restore_all_from_db()
 
-    # تشغيل Flask في thread ثانوي
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     log("[SERVER] Flask يعمل في الخلفية")
 
-    # تشغيل البوت في الـ main thread
+    # إصلاح ضروري لـ Python 3.13+/3.14: asyncio.get_event_loop() لا يعود
+    # ينشئ event loop تلقائياً بالـ main thread إن لم يوجد واحد فعلياً شغّال،
+    # ويرمي RuntimeError بدلاً من ذلك. ننشئه ونثبّته يدوياً قبل تشغيل البوت
+    # حتى تجده مكتبة python-telegram-bot داخلياً عند الحاجة له.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     from bot import app as telegram_app
     log("[BOT] جاري تشغيل بوت تيليجرام...")
     telegram_app.run_polling(
