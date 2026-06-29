@@ -317,6 +317,44 @@ SPECIFIC REQUIREMENTS:
 Return ONLY the JSON object with projectType="game"."""
 
 
+MULTI_GAME_HUB_ADDENDUM = """
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MULTI-GAME HUB MODE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+This request asks for MULTIPLE games in ONE project. Build a single project where:
+- A start/menu screen shows a clickable card for EACH requested game (name + emoji icon,
+  premium hover effect)
+- Clicking a game card hides the menu and shows that game's FULL UI — pure JS show/hide of
+  different <div> sections, NO page reload, NO navigating to another URL
+- Each game must be 100% COMPLETELY implemented and fully playable, to the EXACT same
+  mandatory standard as a single game (own score, own pause/restart, own win/lose, own
+  controls) — none of them may be a stub, placeholder, or simplified version
+- Every game's grid/board MUST actually render with visible cells/tiles given real CSS
+  dimensions (width/height/grid-template) — an empty or invisible board is a failure
+- A "⬅ رجوع للقائمة" / "⬅ Back to menu" button inside each game returns to the main menu
+- index.html contains ALL games' markup as separate sections; style.css contains ALL styling;
+  script.js contains ALL logic with clearly separated, independently working functions per
+  game (e.g. initBlockudoku(), initSudoku()) — never share/mix state between games
+- The menu screen itself must look premium (dark theme, glassmorphism cards, hover lift)
+"""
+
+
+MULTI_GAME_BUILD_PROMPT = """Build a COMPLETE multi-game hub website with FULLY PLAYABLE games.
+
+REQUEST: {request}
+
+GAMES TO INCLUDE — build EVERY single one of these completely, no shortcuts, no stubs:
+{games_block}
+
+Each game above must meet ALL the mandatory game requirements (complete logic, win/lose,
+real-time score + high score, pause/restart, 60fps animation, keyboard+touch controls,
+sound effects, start screen, game-over screen, MOBILE RESPONSIVE, and a VISIBLE rendered
+board/grid) to the exact same standard as if it were the only game in the project.
+
+Return ONLY the JSON object with projectType="game"."""
+
+
 EDIT_PROMPT = """You are editing an existing project. Understand the current code fully before making changes.
 
 PROJECT SUMMARY: {code_summary}
@@ -358,20 +396,21 @@ def _detect_project_type(text: str) -> str:
     return "website"
 
 
-def _detect_game_type(text: str) -> tuple[str, str]:
-    """يكتشف نوع اللعبة ومتطلباتها الخاصة."""
-    text_lower = text.lower()
-
-    games = {
-        "blockudoku": ("Blockudoku", """
+_GAME_DEFS = {
+    "Blockudoku": {
+        "aliases": ["blockudoku", "بلوكودوكو"],
+        "reqs": """
 - 9x9 grid with 3x3 section highlighting
 - 3 random pieces shown at bottom, drag to place
 - Clear complete rows, columns, AND 3x3 boxes
 - Score multipliers for multiple clears at once
 - Combo system
 - Piece preview with ghost placement
-- Game over when no piece can be placed"""),
-        "sudoku": ("Sudoku", """
+- Game over when no piece can be placed""",
+    },
+    "Sudoku": {
+        "aliases": ["sudoku", "سودوكو", "سودكو"],
+        "reqs": """
 - 9x9 grid with 3x3 box borders (thicker lines)
 - 3 difficulty levels: Easy(35 given)/Medium(27)/Hard(20)
 - Number pad 1-9 + Erase button
@@ -379,22 +418,31 @@ def _detect_game_type(text: str) -> tuple[str, str]:
 - Error detection (mark wrong numbers red)
 - Hint system (reveal one cell)
 - Timer + undo last move
-- Auto-save current puzzle in localStorage"""),
-        "2048": ("2048", """
+- Auto-save current puzzle in localStorage""",
+    },
+    "2048": {
+        "aliases": ["2048"],
+        "reqs": """
 - 4x4 grid with smooth slide animations
 - Arrow keys + swipe gestures
 - Merge tiles animation + score popup
 - New random tile after each move
 - Win at 2048 but allow continuing
-- Best score in localStorage"""),
-        "snake": ("Snake", """
+- Best score in localStorage""",
+    },
+    "Snake": {
+        "aliases": ["snake", "سنيك", "ثعبان"],
+        "reqs": """
 - Canvas-based smooth movement
 - Arrow keys + WASD + swipe
 - Food spawns avoiding snake body
 - Speed increases every 5 food items
 - Wall wrap-around option
-- Particle effect on eating food"""),
-        "tetris": ("Tetris", """
+- Particle effect on eating food""",
+    },
+    "Tetris": {
+        "aliases": ["tetris", "تيتريس"],
+        "reqs": """
 - All 7 tetromino pieces with correct colors
 - Wall kicks for rotation
 - Ghost piece (semi-transparent preview)
@@ -402,26 +450,50 @@ def _detect_game_type(text: str) -> tuple[str, str]:
 - Next piece preview (show next 3)
 - Line clear animation
 - Increasing speed per level
-- T-spin detection bonus"""),
-        "memory": ("Memory Match", """
+- T-spin detection bonus""",
+    },
+    "Memory Match": {
+        "aliases": ["memory", "ميمورى", "ذاكرة"],
+        "reqs": """
 - 4x4 or 6x6 grid of cards
 - Flip animation (3D CSS transform)
 - Match detection + lock matched pairs
 - Attempt counter + timer
 - Shuffle on restart
-- Win screen with stats"""),
-    }
+- Win screen with stats""",
+    },
+}
 
-    for key, (name, reqs) in games.items():
-        if key in text_lower:
-            return name, reqs
-
-    # لعبة عامة
-    return "Browser Game", """
+_GENERIC_GAME_REQS = """
 - Complete game loop (start → play → win/lose → restart)
 - Score system
 - Increasing difficulty
 - Mobile-friendly controls"""
+
+
+def _detect_game_type(text: str) -> tuple[str, str]:
+    """يكتشف لعبة واحدة (أول تطابق) ومتطلباتها الخاصة — للاستخدام عند طلب لعبة واحدة فقط."""
+    text_lower = text.lower()
+    for name, info in _GAME_DEFS.items():
+        if any(alias in text_lower for alias in info["aliases"]):
+            return name, info["reqs"]
+    return "Browser Game", _GENERIC_GAME_REQS
+
+
+def _detect_all_games(text: str) -> list:
+    """
+    يكتشف كل الألعاب المذكورة صراحة بالطلب (لطلبات تريد أكثر من لعبة بصفحة واحدة،
+    مثل: 'موقع فيه خيارين: لعبة Blockudoku ولعبة سودوكو').
+    يرجع قائمة [(الاسم, المتطلبات), ...] بترتيب ظهورها بالنص.
+    """
+    text_lower = text.lower()
+    matches = []
+    for name, info in _GAME_DEFS.items():
+        positions = [text_lower.find(a) for a in info["aliases"] if a in text_lower]
+        if positions:
+            matches.append((min(positions), name, info["reqs"]))
+    matches.sort(key=lambda x: x[0])
+    return [(name, reqs) for _, name, reqs in matches]
 
 
 def compress_code_for_prompt(current_code: str, max_chars: int = 8000) -> str:
@@ -573,7 +645,7 @@ def _check_game_quality(js: str) -> tuple[bool, list]:
 
 # ─── Groq API Call ────────────────────────────
 def _groq_call(prompt: str, system: str = None, retries: int = 5,
-               is_game: bool = False) -> str:
+               is_game: bool = False, max_tokens: int = 8000) -> str:
     last_err = last_raw = None
     sys = system or BASE_SYSTEM
     messages = [
@@ -587,7 +659,7 @@ def _groq_call(prompt: str, system: str = None, retries: int = 5,
                 model=GROQ_MODEL,
                 messages=messages,
                 temperature=0.45 if not is_game else 0.35,
-                max_tokens=8000,
+                max_tokens=max_tokens,
                 response_format={"type": "json_object"},
             )
             last_raw = resp.choices[0].message.content.strip()
@@ -623,7 +695,7 @@ def _groq_call(prompt: str, system: str = None, retries: int = 5,
 
 
 # ─── Anthropic API Call (للمشاريع المعقدة) ───
-def _anthropic_call(prompt: str, system: str = None, is_game: bool = False) -> str:
+def _anthropic_call(prompt: str, system: str = None, is_game: bool = False, max_tokens: int = 8000) -> str:
     if not ANTHROPIC_KEY:
         raise RuntimeError("ANTHROPIC_API_KEY غير مضبوط")
 
@@ -639,7 +711,7 @@ def _anthropic_call(prompt: str, system: str = None, is_game: bool = False) -> s
         },
         json={
             "model":      ANTHROPIC_MODEL,
-            "max_tokens": 8000,
+            "max_tokens": max_tokens,
             "system":     sys,
             "messages":   [{"role": "user", "content": prompt}],
         },
@@ -661,15 +733,15 @@ def _anthropic_call(prompt: str, system: str = None, is_game: bool = False) -> s
 
 
 def _call_with_fallback(prompt: str, system: str = None, is_game: bool = False,
-                        retries: int = 4) -> str:
+                        retries: int = 4, max_tokens: int = 8000) -> str:
     """يجرب Groq أولاً، ثم Anthropic عند الفشل."""
     try:
-        return _groq_call(prompt, system=system, retries=retries, is_game=is_game)
+        return _groq_call(prompt, system=system, retries=retries, is_game=is_game, max_tokens=max_tokens)
     except RuntimeError as groq_err:
         if ANTHROPIC_KEY:
             from logger import log
             log(f"[AI_FALLBACK] Groq فشل، جاري المحاولة مع Anthropic: {groq_err}")
-            return _anthropic_call(prompt, system=system, is_game=is_game)
+            return _anthropic_call(prompt, system=system, is_game=is_game, max_tokens=max_tokens)
         raise
 
 
@@ -712,7 +784,15 @@ def builder(request: str) -> str:
 
 
 def game_builder(request: str) -> str:
-    """يبني لعبة كاملة قابلة للعب."""
+    """يبني لعبة كاملة قابلة للعب — أو صفحة فيها أكثر من لعبة لو الطلب يذكر أكثر من واحدة."""
+    matched = _detect_all_games(request)
+
+    if len(matched) >= 2:
+        games_block = "\n\n".join(f"### {name}\n{reqs}" for name, reqs in matched)
+        prompt = MULTI_GAME_BUILD_PROMPT.format(request=request, games_block=games_block)
+        system = GAME_SYSTEM + MULTI_GAME_HUB_ADDENDUM
+        return _call_with_fallback(prompt, system=system, is_game=True, retries=5, max_tokens=16000)
+
     game_name, game_reqs = _detect_game_type(request)
     prompt = GAME_BUILD_PROMPT.format(
         game_type=game_name,
@@ -740,6 +820,14 @@ def build_from_conversation(conversation: list) -> str:
             links_block = web_search.format_links_for_prompt(results)
 
     if ptype == "game":
+        matched = _detect_all_games(full_request)
+
+        if len(matched) >= 2:
+            games_block = "\n\n".join(f"### {name}\n{reqs}" for name, reqs in matched)
+            prompt = MULTI_GAME_BUILD_PROMPT.format(request=full_request, games_block=games_block) + links_block
+            system = GAME_SYSTEM + MULTI_GAME_HUB_ADDENDUM
+            return _call_with_fallback(prompt, system=system, is_game=True, retries=5, max_tokens=16000)
+
         game_name, game_reqs = _detect_game_type(full_request)
         prompt = GAME_BUILD_PROMPT.format(
             game_type=game_name,
